@@ -1,0 +1,24 @@
+{
+  "name": "hivebeats",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm run --parallel dev",
+    "dev:mobile": "pnpm --filter mobile dev",
+    "dev:desktop": "pnpm --filter desktop dev",
+    "dev:web": "pnpm --filter web dev",
+    "build": "pnpm run --filter \"./apps/**\" build",
+    "build:packages": "pnpm run --filter \"./packages/**\" build",
+    "test": "pnpm run --recursive test",
+    "lint": "pnpm run --recursive lint",
+    "typecheck": "pnpm run --recursive typecheck",
+    "clean": "rimraf node_modules apps/*/node_modules packages/*/node_modules"
+  },
+  "devDependencies": {
+    "eslint": "^10.4.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.0.5",
+    "prettier": "^3.8.3",
+    "typescript": "^6.0.3"
+  }
+}

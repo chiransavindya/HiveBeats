@@ -1,0 +1,20 @@
+node_modules/
+.pnpm-store/
+.env
+.env.*
+.DS_Store
+*.log
+coverage/
+dist/
+dist-electron/
+apps/desktop/dist-electron/
+build/
+.vite/
+.expo/
+.turbo/
+**/package-lock.json
+docs/
+
+# Supabase local
+supabase/.temp/
+supabase/.branches/
