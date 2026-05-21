@@ -1,9 +1,10 @@
-import { app, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain } from 'electron'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import type { Service } from 'bonjour-service'
 import { advertiseSession, destroyBonjour, startDiscovery } from './mdns'
+import { startFileStream, type StreamController } from './streamer'
 import {
   broadcastToGuests,
   connectToHost,
@@ -40,6 +41,8 @@ let win: BrowserWindow | null
 let advertisedService: Service | null = null
 let stopDiscovery: (() => void) | null = null
 let stopUdpListener: (() => void) | null = null
+let activeStream: StreamController | null = null
+let activeStreamTrackId: string | null = null
 
 function createWindow() {
   win = new BrowserWindow({
@@ -179,6 +182,89 @@ ipcMain.handle('socket:broadcast', (_event, payload: { message: string }) => {
   return { ok: true }
 })
 
+ipcMain.handle('dialog:pick-audio', async () => {
+  const result = await dialog.showOpenDialog({
+    properties: ['openFile'],
+    filters: [
+      { name: 'Audio', extensions: ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg'] },
+      { name: 'All Files', extensions: ['*'] },
+    ],
+  })
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return { canceled: true }
+  }
+
+  const filePath = result.filePaths[0]
+  return {
+    canceled: false,
+    filePath,
+    fileName: path.basename(filePath),
+    mimeType: getMimeType(filePath),
+  }
+})
+
+ipcMain.handle('stream:start', (_event, payload: { filePath: string; fileName: string; mimeType: string; trackId: string }) => {
+  activeStream?.stop()
+  activeStreamTrackId = payload.trackId
+
+  broadcastToGuests(
+    JSON.stringify({
+      type: 'STREAM_INIT',
+      trackId: payload.trackId,
+      fileName: payload.fileName,
+      mimeType: payload.mimeType,
+    }),
+  )
+
+  activeStream = startFileStream(payload.filePath, 64 * 1024, {
+    onChunk: (chunk, seq) => {
+      broadcastToGuests(
+        JSON.stringify({
+          type: 'STREAM_CHUNK',
+          trackId: payload.trackId,
+          seq,
+          data: chunk.toString('base64'),
+        }),
+      )
+    },
+    onEnd: () => {
+      broadcastToGuests(
+        JSON.stringify({
+          type: 'STREAM_END',
+          trackId: payload.trackId,
+        }),
+      )
+    },
+    onError: (error) => {
+      broadcastToGuests(
+        JSON.stringify({
+          type: 'STREAM_END',
+          trackId: payload.trackId,
+          error: error.message,
+        }),
+      )
+    },
+  })
+
+  return { ok: true }
+})
+
+ipcMain.handle('stream:stop', () => {
+  activeStream?.stop()
+  activeStream = null
+  if (activeStreamTrackId) {
+    broadcastToGuests(
+      JSON.stringify({
+        type: 'STREAM_END',
+        trackId: activeStreamTrackId,
+      }),
+    )
+  }
+  activeStreamTrackId = null
+  return { ok: true }
+})
+
 ipcMain.handle(
   'udp:start-broadcast',
   (_event, payload: {
@@ -252,5 +338,25 @@ function safeParseJson(data: string) {
     return JSON.parse(data)
   } catch {
     return data
+  }
+}
+
+function getMimeType(filePath: string) {
+  const ext = path.extname(filePath).toLowerCase()
+  switch (ext) {
+    case '.mp3':
+      return 'audio/mpeg'
+    case '.wav':
+      return 'audio/wav'
+    case '.m4a':
+      return 'audio/mp4'
+    case '.aac':
+      return 'audio/aac'
+    case '.flac':
+      return 'audio/flac'
+    case '.ogg':
+      return 'audio/ogg'
+    default:
+      return 'audio/mpeg'
   }
 }

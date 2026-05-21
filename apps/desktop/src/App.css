@@ -128,6 +128,38 @@ h2 {
   color: var(--ink-muted);
 }
 
+.audio-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: center;
+}
+
+.track-meta {
+  display: grid;
+  gap: 4px;
+}
+
+.track-name {
+  font-weight: 600;
+}
+
+.track-sub {
+  font-size: 0.9rem;
+  color: var(--ink-muted);
+}
+
+.transport {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.timeline {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
 .settings-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -309,6 +341,10 @@ h2 {
   border: 1px solid var(--border);
   background: rgba(255, 255, 255, 0.75);
   font-size: 0.9rem;
+}
+
+.hidden-audio {
+  display: none;
 }
 
 @media (max-width: 720px) {

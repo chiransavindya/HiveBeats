@@ -80,6 +80,15 @@ contextBridge.exposeInMainWorld('hivebeats', {
     ipcRenderer.on('socket:message', handler)
     return () => ipcRenderer.off('socket:message', handler)
   },
+  pickAudioFile() {
+    return ipcRenderer.invoke('dialog:pick-audio')
+  },
+  startStream(filePath: string, fileName: string, mimeType: string, trackId: string) {
+    return ipcRenderer.invoke('stream:start', { filePath, fileName, mimeType, trackId })
+  },
+  stopStream() {
+    return ipcRenderer.invoke('stream:stop')
+  },
   startUdpBroadcast(
     sessionCode: string,
     hostPort: number,

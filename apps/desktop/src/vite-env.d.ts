@@ -21,6 +21,17 @@ interface Window {
 		broadcastToGuests: (message: unknown) => Promise<{ ok: boolean }>
 		onSocketStatus: (callback: (status: SocketStatusPayload) => void) => () => void
 		onSocketMessage: (callback: (message: SocketMessagePayload) => void) => () => void
+		pickAudioFile: () => Promise<
+			| { canceled: true }
+			| { canceled: false; filePath: string; fileName: string; mimeType: string }
+		>
+		startStream: (
+			filePath: string,
+			fileName: string,
+			mimeType: string,
+			trackId: string,
+		) => Promise<{ ok: boolean }>
+		stopStream: () => Promise<{ ok: boolean }>
 		startUdpBroadcast: (
 			sessionCode: string,
 			hostPort: number,
