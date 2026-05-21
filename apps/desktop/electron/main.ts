@@ -1,7 +1,19 @@
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, ipcMain } from 'electron'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
+import type { Service } from 'bonjour-service'
+import { advertiseSession, destroyBonjour, startDiscovery } from './mdns'
+import {
+  broadcastToGuests,
+  connectToHost,
+  disconnectFromHost,
+  sendToGuest,
+  sendToHost,
+  startHost,
+  stopHost,
+} from './socket'
+import { startBroadcast, startListener, stopBroadcast, stopListener } from './udp'
 
 const require = createRequire(import.meta.url)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -25,6 +37,9 @@ export const RENDERER_DIST = path.join(process.env.APP_ROOT, 'dist')
 process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL ? path.join(process.env.APP_ROOT, 'public') : RENDERER_DIST
 
 let win: BrowserWindow | null
+let advertisedService: Service | null = null
+let stopDiscovery: (() => void) | null = null
+let stopUdpListener: (() => void) | null = null
 
 function createWindow() {
   win = new BrowserWindow({
@@ -47,11 +62,176 @@ function createWindow() {
   }
 }
 
+ipcMain.handle('mdns:advertise', (_event, payload: { sessionCode: string; port: number }) => {
+  advertisedService?.stop()
+  advertisedService = advertiseSession(payload.sessionCode, payload.port)
+  return { ok: true }
+})
+
+ipcMain.handle('mdns:stop-advertise', () => {
+  advertisedService?.stop()
+  advertisedService = null
+  return { ok: true }
+})
+
+ipcMain.handle('mdns:start-discovery', (event) => {
+  stopDiscovery?.()
+  const sender = event.sender
+  stopDiscovery = startDiscovery(
+    (service) => sender.send('mdns:service-up', service),
+    (service) => sender.send('mdns:service-down', service),
+  )
+  return { ok: true }
+})
+
+ipcMain.handle('mdns:stop-discovery', () => {
+  stopDiscovery?.()
+  stopDiscovery = null
+  return { ok: true }
+})
+
+ipcMain.handle('socket:start-host', (event, payload: { port: number }) => {
+  startHost(payload.port, {
+    onClientConnected: (client) => {
+      event.sender.send('socket:status', {
+        role: 'host',
+        status: 'client-connected',
+        clientId: client.id,
+        address: client.address,
+      })
+    },
+    onClientDisconnected: (client) => {
+      event.sender.send('socket:status', {
+        role: 'host',
+        status: 'client-disconnected',
+        clientId: client.id,
+      })
+    },
+    onClientMessage: (client, data) => {
+      event.sender.send('socket:message', {
+        role: 'host',
+        clientId: client.id,
+        message: safeParseJson(data),
+      })
+    },
+    onHostError: (error) => {
+      event.sender.send('socket:status', {
+        role: 'host',
+        status: 'error',
+        message: error.message,
+      })
+    },
+  })
+
+  event.sender.send('socket:status', { role: 'host', status: 'started' })
+  return { ok: true }
+})
+
+ipcMain.handle('socket:stop-host', (event) => {
+  stopHost()
+  event.sender.send('socket:status', { role: 'host', status: 'stopped' })
+  return { ok: true }
+})
+
+ipcMain.handle('socket:connect', (event, payload: { host: string; port: number }) => {
+  connectToHost(payload.host, payload.port, {
+    onConnected: () => {
+      event.sender.send('socket:status', { role: 'guest', status: 'connected' })
+    },
+    onDisconnected: () => {
+      event.sender.send('socket:status', { role: 'guest', status: 'disconnected' })
+    },
+    onMessage: (data) => {
+      event.sender.send('socket:message', {
+        role: 'guest',
+        message: safeParseJson(data),
+      })
+    },
+    onError: (error) => {
+      event.sender.send('socket:status', {
+        role: 'guest',
+        status: 'error',
+        message: error.message,
+      })
+    },
+  })
+
+  return { ok: true }
+})
+
+ipcMain.handle('socket:disconnect', () => {
+  disconnectFromHost()
+  return { ok: true }
+})
+
+ipcMain.handle('socket:send-to-host', (_event, payload: { message: string }) => {
+  const ok = sendToHost(payload.message)
+  return { ok }
+})
+
+ipcMain.handle('socket:send-to-guest', (_event, payload: { clientId: string; message: string }) => {
+  const ok = sendToGuest(payload.clientId, payload.message)
+  return { ok }
+})
+
+ipcMain.handle('socket:broadcast', (_event, payload: { message: string }) => {
+  broadcastToGuests(payload.message)
+  return { ok: true }
+})
+
+ipcMain.handle(
+  'udp:start-broadcast',
+  (_event, payload: {
+    sessionCode: string
+    hostPort: number
+    broadcastPort: number
+    intervalMs: number
+    deviceId: string
+  }) => {
+    startBroadcast(
+      payload.sessionCode,
+      payload.hostPort,
+      payload.broadcastPort,
+      payload.intervalMs,
+      payload.deviceId,
+    )
+    return { ok: true }
+  },
+)
+
+ipcMain.handle('udp:stop-broadcast', () => {
+  stopBroadcast()
+  return { ok: true }
+})
+
+ipcMain.handle('udp:start-listen', (event, payload: { broadcastPort: number; deviceId: string }) => {
+  stopUdpListener?.()
+  startListener(
+    payload.broadcastPort,
+    payload.deviceId,
+    (announcement) => event.sender.send('udp:announcement', announcement),
+    (error) => event.sender.send('udp:error', { message: error.message }),
+  )
+  stopUdpListener = () => stopListener()
+  return { ok: true }
+})
+
+ipcMain.handle('udp:stop-listen', () => {
+  stopUdpListener?.()
+  stopUdpListener = null
+  return { ok: true }
+})
+
 // Quit when all windows are closed, except on macOS. There, it's common
 // for applications and their menu bar to stay active until the user quits
 // explicitly with Cmd + Q.
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
+    advertisedService?.stop()
+    stopDiscovery?.()
+    stopBroadcast()
+    stopUdpListener?.()
+    destroyBonjour()
     app.quit()
     win = null
   }
@@ -66,3 +246,11 @@ app.on('activate', () => {
 })
 
 app.whenReady().then(createWindow)
+
+function safeParseJson(data: string) {
+  try {
+    return JSON.parse(data)
+  } catch {
+    return data
+  }
+}
