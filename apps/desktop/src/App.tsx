@@ -14,7 +14,6 @@ import type {
   SeekCommandMessage,
   StreamChunkMessage,
   StreamEndMessage,
-  StreamInitMessage,
   StreamMessage,
   SyncPingMessage,
   SyncPongMessage,
@@ -70,6 +69,11 @@ function App() {
   const [hostPositionMs, setHostPositionMs] = useState(0)
   const [guestTrackName, setGuestTrackName] = useState('')
   const [clockOffsetMs, setClockOffsetMs] = useState(0)
+  const [guestVolume, setGuestVolume] = useState(0.9)
+  const [guestMuted, setGuestMuted] = useState(false)
+  const [guestStreamReady, setGuestStreamReady] = useState(false)
+  const [guestSyncReady, setGuestSyncReady] = useState(false)
+  const [pendingPlay, setPendingPlay] = useState(false)
   const [hostPortInput, setHostPortInput] = useState('7400')
   const [joinPortInput, setJoinPortInput] = useState('7400')
   const [broadcastPortInput, setBroadcastPortInput] = useState('7401')
@@ -81,19 +85,32 @@ function App() {
     port: number
   } | null>(null)
   const [retryCount, setRetryCount] = useState(0)
+
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const syncTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const hostPlayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const hostPauseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hostAudioRef = useRef<HTMLAudioElement | null>(null)
   const guestAudioRef = useRef<HTMLAudioElement | null>(null)
   const mediaSourceRef = useRef<MediaSource | null>(null)
   const sourceBufferRef = useRef<SourceBuffer | null>(null)
   const chunkQueueRef = useRef<Uint8Array[]>([])
   const streamEndPendingRef = useRef(false)
-  const syncTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const guestBufferedBytesRef = useRef(0)
+  const guestReadySentRef = useRef(false)
+  const pendingPlayRef = useRef(false)
+  const guestStreamReadyRef = useRef(false)
+  const guestSyncReadyRef = useRef(false)
+  const clockOffsetRef = useRef(0)
+  const pendingPlaybackPositionRef = useRef(0)
+
   const hostPort = Number(hostPortInput) || 7400
   const joinPort = Number(joinPortInput) || hostPort
   const broadcastPort = Number(broadcastPortInput) || 7401
   const broadcastIntervalMs = 3000
   const maxRetries = 3
+  const showHostControls = hostRunning
+  const showGuestControls = guestConnected && !hostRunning
   const deviceId = useMemo(() => crypto.randomUUID(), [])
   const deviceAlias = useMemo(() => `Desktop-${deviceId.slice(0, 4)}`, [deviceId])
 
@@ -154,7 +171,7 @@ function App() {
   const filePathToUrl = (filePath: string) => {
     const normalized = filePath.replace(/\\/g, '/')
     const withLeadingSlash = normalized.startsWith('/') ? normalized : `/${normalized}`
-    return `file://${withLeadingSlash}`
+    return `hivebeats://file${withLeadingSlash}`
   }
 
   const decodeBase64 = (data: string) => {
@@ -171,7 +188,8 @@ function App() {
     if (!sourceBuffer || sourceBuffer.updating) return
     const chunk = chunkQueueRef.current.shift()
     if (chunk) {
-      sourceBuffer.appendBuffer(chunk)
+      const buffer = Uint8Array.from(chunk).buffer
+      sourceBuffer.appendBuffer(buffer)
       return
     }
     if (streamEndPendingRef.current && mediaSourceRef.current?.readyState === 'open') {
@@ -179,6 +197,50 @@ function App() {
       mediaSourceRef.current.endOfStream()
     }
   }, [])
+
+  const checkGuestReady = useCallback(() => {
+    if (guestReadySentRef.current) return
+    const audio = guestAudioRef.current
+    if (!audio || audio.buffered.length === 0) return
+    const bufferedEnd = audio.buffered.end(audio.buffered.length - 1)
+    const bufferedAhead = bufferedEnd - audio.currentTime
+    if (bufferedAhead >= 2.5) {
+      guestReadySentRef.current = true
+      guestStreamReadyRef.current = true
+      setGuestStreamReady(true)
+      window.hivebeats.sendToHost({
+        type: 'STREAM_READY',
+        trackId: guestTrackId ?? 'unknown',
+      })
+    }
+  }, [guestTrackId])
+
+  const scheduleHostPlay = (playAt: number) => {
+    const audio = hostAudioRef.current
+    if (!audio) return
+    if (hostPlayTimerRef.current) {
+      clearTimeout(hostPlayTimerRef.current)
+    }
+    const delay = Math.max(0, playAt - Date.now())
+    hostPlayTimerRef.current = setTimeout(() => {
+      audio.play().catch(() => {
+        setHostError('Unable to start playback. Try again.')
+      })
+    }, delay)
+  }
+
+  const scheduleHostPause = (pauseAt: number) => {
+    const audio = hostAudioRef.current
+    if (!audio) return
+    if (hostPauseTimerRef.current) {
+      clearTimeout(hostPauseTimerRef.current)
+    }
+    const delay = Math.max(0, pauseAt - Date.now())
+    hostPauseTimerRef.current = setTimeout(() => {
+      audio.pause()
+      setHostPlaying(false)
+    }, delay)
+  }
 
   const resetGuestStream = useCallback(
     (mimeType: string, fileName: string) => {
@@ -191,6 +253,10 @@ function App() {
 
       chunkQueueRef.current = []
       streamEndPendingRef.current = false
+      guestBufferedBytesRef.current = 0
+      guestReadySentRef.current = false
+      guestStreamReadyRef.current = false
+      setGuestStreamReady(false)
       setGuestTrackName(fileName)
 
       const mediaSource = new MediaSource()
@@ -202,14 +268,17 @@ function App() {
         try {
           const sourceBuffer = mediaSource.addSourceBuffer(mimeType)
           sourceBufferRef.current = sourceBuffer
-          sourceBuffer.addEventListener('updateend', appendNextChunk)
+          sourceBuffer.addEventListener('updateend', () => {
+            appendNextChunk()
+            checkGuestReady()
+          })
           appendNextChunk()
         } catch {
           setGuestError('Stream mime type not supported on this device.')
         }
       })
     },
-    [appendNextChunk],
+    [appendNextChunk, checkGuestReady],
   )
 
   const handleNewCode = () => {
@@ -233,22 +302,47 @@ function App() {
     const audio = hostAudioRef.current
     if (audio) {
       audio.src = filePathToUrl(result.filePath)
+      audio.muted = false
+      audio.volume = 1
       audio.load()
     }
 
     addLog(`Loaded ${result.fileName}`)
   }
 
-  const scheduleLocalPlay = (playAt: number) => {
-    const audio = hostAudioRef.current
-    if (!audio) return
-    const delay = Math.max(0, playAt - Date.now())
-    setTimeout(() => {
-      audio.play().catch(() => {
-        setHostError('Unable to start playback. Try again.')
-      })
-    }, delay)
-  }
+  const startPlayback = useCallback(
+    async (positionMs: number) => {
+      if (!selectedTrack) return
+      const playAt = Date.now() + 800
+      const command: PlayCommandMessage = {
+        type: 'CMD_PLAY',
+        trackId: selectedTrack.id,
+        playAt,
+        positionMs,
+      }
+
+      await window.hivebeats.broadcastToGuests(command)
+      const audio = hostAudioRef.current
+      if (!audio) return
+      audio.muted = false
+      audio.volume = 1
+      scheduleHostPlay(playAt)
+      setHostPlaying(true)
+      setPendingPlay(false)
+      pendingPlayRef.current = false
+    },
+    [selectedTrack],
+  )
+
+  const maybeStartPendingPlayback = useCallback(() => {
+    if (!pendingPlayRef.current) return
+    if (!guestStreamReadyRef.current) return
+    if (!guestSyncReadyRef.current) return
+
+    pendingPlayRef.current = false
+    setPendingPlay(false)
+    startPlayback(pendingPlaybackPositionRef.current)
+  }, [startPlayback])
 
   const handlePlay = async () => {
     if (!selectedTrack) {
@@ -270,19 +364,22 @@ function App() {
       addLog('Streaming to guests')
     }
 
-    const playAt = Date.now() + 800
     const positionMs = audio.currentTime * 1000
 
-    const command: PlayCommandMessage = {
-      type: 'CMD_PLAY',
-      trackId: selectedTrack.id,
-      playAt,
-      positionMs,
+    if (guestCount > 0 && (!guestStreamReadyRef.current || !guestSyncReadyRef.current)) {
+      setPendingPlay(true)
+      pendingPlayRef.current = true
+      pendingPlaybackPositionRef.current = positionMs
+      addLog('Buffering guest before play...')
+      setTimeout(() => {
+        if (pendingPlayRef.current) {
+          startPlayback(positionMs)
+        }
+      }, 1500)
+      return
     }
 
-    await window.hivebeats.broadcastToGuests(command)
-    scheduleLocalPlay(playAt)
-    setHostPlaying(true)
+    await startPlayback(positionMs)
   }
 
   const handlePause = async () => {
@@ -299,11 +396,7 @@ function App() {
     }
 
     await window.hivebeats.broadcastToGuests(command)
-    const delay = Math.max(0, pauseAt - Date.now())
-    setTimeout(() => {
-      audio.pause()
-      setHostPlaying(false)
-    }, delay)
+    scheduleHostPause(pauseAt)
   }
 
   const handleStop = async () => {
@@ -315,6 +408,8 @@ function App() {
     setHostPositionMs(0)
     setStreamingTrackId(null)
     await window.hivebeats.stopStream()
+    setPendingPlay(false)
+    pendingPlayRef.current = false
 
     const command: PauseCommandMessage = {
       type: 'CMD_PAUSE',
@@ -330,7 +425,7 @@ function App() {
     const audio = hostAudioRef.current
     if (!audio) return
 
-    const playAt = Date.now() + 400
+    const playAt = Date.now() + 800
     audio.currentTime = positionMs / 1000
 
     const command: SeekCommandMessage = {
@@ -342,7 +437,7 @@ function App() {
 
     await window.hivebeats.broadcastToGuests(command)
     if (hostPlaying) {
-      scheduleLocalPlay(playAt)
+      scheduleHostPlay(playAt)
     }
   }
 
@@ -377,14 +472,14 @@ function App() {
     addLog('Host stopped')
   }
 
-  const sendHello = async () => {
+  const sendHello = useCallback(async () => {
     const message: HostHelloMessage = {
       type: 'HELLO',
       deviceId,
       alias: deviceAlias,
     }
     await window.hivebeats.sendToHost(message)
-  }
+  }, [deviceAlias, deviceId])
 
   const connectToHost = async (host: string, port: number) => {
     if (!host) {
@@ -542,6 +637,12 @@ function App() {
   }, [guestConnected])
 
   useEffect(() => {
+    const audio = guestAudioRef.current
+    if (!audio) return
+    audio.volume = guestMuted ? 0 : guestVolume
+  }, [guestMuted, guestVolume])
+
+  useEffect(() => {
     if (!hostRunning) return
 
     if (mdnsEnabled) {
@@ -589,6 +690,8 @@ function App() {
       if (status.role === 'guest') {
         if (status.status === 'connected') {
           setGuestConnected(true)
+          setGuestSyncReady(false)
+          guestSyncReadyRef.current = false
           setGuestError(null)
           sendHello()
           addLog('Guest connected to host')
@@ -601,6 +704,8 @@ function App() {
         if (status.status === 'disconnected') {
           setGuestConnected(false)
           setGuestHostId('')
+          setGuestSyncReady(false)
+          guestSyncReadyRef.current = false
           addLog('Guest disconnected from host')
           scheduleRetry()
         }
@@ -642,6 +747,18 @@ function App() {
           }
           window.hivebeats.sendToGuest(payload.clientId, pong)
         }
+
+        if (streamMessage.type === 'STREAM_READY') {
+          setGuestStreamReady(true)
+          guestStreamReadyRef.current = true
+          if (pendingPlayRef.current) {
+            const audio = hostAudioRef.current
+            const positionMs = audio ? audio.currentTime * 1000 : 0
+            setTimeout(() => {
+              startPlayback(positionMs)
+            }, 50)
+          }
+        }
       }
 
       if (payload.role === 'guest' && typeof payload.message === 'object' && payload.message) {
@@ -656,6 +773,10 @@ function App() {
           const t3 = Date.now()
           const offset = ((streamMessage.t1 - streamMessage.t0) + (streamMessage.t2 - t3)) / 2
           setClockOffsetMs(offset)
+          clockOffsetRef.current = offset
+          setGuestSyncReady(true)
+          guestSyncReadyRef.current = true
+          maybeStartPendingPlayback()
         }
 
         if (streamMessage.type === 'STREAM_INIT') {
@@ -668,7 +789,9 @@ function App() {
         if (streamMessage.type === 'STREAM_CHUNK') {
           const chunkMessage = streamMessage as StreamChunkMessage
           chunkQueueRef.current.push(decodeBase64(chunkMessage.data))
+          guestBufferedBytesRef.current += chunkMessage.data.length
           appendNextChunk()
+          checkGuestReady()
           return
         }
 
@@ -686,7 +809,7 @@ function App() {
 
         if (streamMessage.type === 'CMD_PLAY') {
           const playCommand = streamMessage as PlayCommandMessage
-          const localPlayTime = playCommand.playAt - clockOffsetMs
+          const localPlayTime = playCommand.playAt - clockOffsetRef.current
           const delay = Math.max(0, localPlayTime - Date.now())
           audio.currentTime = playCommand.positionMs / 1000
           setTimeout(() => {
@@ -699,7 +822,7 @@ function App() {
 
         if (streamMessage.type === 'CMD_PAUSE') {
           const pauseCommand = streamMessage as PauseCommandMessage
-          const localPauseTime = pauseCommand.pauseAt - clockOffsetMs
+          const localPauseTime = pauseCommand.pauseAt - clockOffsetRef.current
           const delay = Math.max(0, localPauseTime - Date.now())
           audio.currentTime = pauseCommand.positionMs / 1000
           setTimeout(() => {
@@ -710,7 +833,7 @@ function App() {
 
         if (streamMessage.type === 'CMD_SEEK') {
           const seekCommand = streamMessage as SeekCommandMessage
-          const localPlayTime = seekCommand.playAt - clockOffsetMs
+          const localPlayTime = seekCommand.playAt - clockOffsetRef.current
           const delay = Math.max(0, localPlayTime - Date.now())
           audio.currentTime = seekCommand.positionMs / 1000
           setTimeout(() => {
@@ -726,13 +849,34 @@ function App() {
       cleanupStatus()
       cleanupMessage()
     }
-  }, [addLog, deviceAlias, deviceId, scheduleRetry, sessionCode])
+  }, [
+    addLog,
+    appendNextChunk,
+    checkGuestReady,
+    deviceAlias,
+    deviceId,
+    guestTrackId,
+    maybeStartPendingPlayback,
+    resetGuestStream,
+    scheduleRetry,
+    sessionCode,
+    sendHello,
+    startPlayback,
+  ])
 
   useEffect(() => {
     return () => {
       if (retryTimerRef.current) {
         clearTimeout(retryTimerRef.current)
         retryTimerRef.current = null
+      }
+      if (hostPlayTimerRef.current) {
+        clearTimeout(hostPlayTimerRef.current)
+        hostPlayTimerRef.current = null
+      }
+      if (hostPauseTimerRef.current) {
+        clearTimeout(hostPauseTimerRef.current)
+        hostPauseTimerRef.current = null
       }
     }
   }, [])
@@ -814,9 +958,7 @@ function App() {
             <span className="toggle-label">Auto-retry</span>
           </label>
         </div>
-        <p className="hint">
-          Tip: keep mDNS + UDP enabled for best LAN discovery reliability.
-        </p>
+        <p className="hint">Tip: keep mDNS + UDP enabled for best LAN discovery reliability.</p>
       </section>
 
       <section className="card">
@@ -856,51 +998,89 @@ function App() {
         ) : null}
       </section>
 
-      <section className="card">
-        <h2>Audio controls</h2>
-        <div className="audio-row">
-          <button type="button" className="btn" onClick={handlePickAudio}>
-            Choose audio file
-          </button>
-          {selectedTrack ? (
-            <div className="track-meta">
-              <div className="track-name">{selectedTrack.fileName}</div>
-              <div className="track-sub">
-                {formatTime(hostPositionMs)} / {formatTime(hostDurationMs)}
+      {showHostControls ? (
+        <section className="card">
+          <h2>Host audio</h2>
+          <div className="audio-row">
+            <button type="button" className="btn" onClick={handlePickAudio}>
+              Choose audio file
+            </button>
+            {selectedTrack ? (
+              <div className="track-meta">
+                <div className="track-name">{selectedTrack.fileName}</div>
+                <div className="track-sub">
+                  {formatTime(hostPositionMs)} / {formatTime(hostDurationMs)}
+                </div>
               </div>
+            ) : (
+              <p className="hint">No track selected yet.</p>
+            )}
+          </div>
+          <div className="transport transport--primary">
+            <button type="button" className="btn" onClick={handlePlay} disabled={!selectedTrack}>
+              Play
+            </button>
+            <button type="button" className="btn btn--ghost" onClick={handlePause} disabled={!selectedTrack}>
+              Pause
+            </button>
+            <button type="button" className="btn btn--ghost" onClick={handleStop} disabled={!selectedTrack}>
+              Stop
+            </button>
+          </div>
+          <input
+            type="range"
+            className="timeline"
+            min={0}
+            max={Math.max(1, hostDurationMs)}
+            value={Math.min(hostPositionMs, hostDurationMs)}
+            onChange={(event) => {
+              const value = Number(event.target.value)
+              setHostPositionMs(value)
+              const audio = hostAudioRef.current
+              if (audio) {
+                audio.currentTime = value / 1000
+              }
+            }}
+            onMouseUp={(event) => handleSeek(Number(event.currentTarget.value))}
+            onTouchEnd={(event) => handleSeek(Number(event.currentTarget.value))}
+            disabled={!selectedTrack}
+          />
+          <div className="meta-row">
+            <span>Stream: {streamingTrackId ? 'Active' : 'Idle'}</span>
+            <span>Guest track: {guestTrackName || 'Waiting for stream'}</span>
+            <span>Clock offset: {clockOffsetMs.toFixed(0)}ms</span>
+            <span>Guest ready: {guestStreamReady ? 'Yes' : 'No'}</span>
+            <span>Sync ready: {guestSyncReady ? 'Yes' : 'No'}</span>
+            <span>Pending play: {pendingPlay ? 'Yes' : 'No'}</span>
+          </div>
+        </section>
+      ) : null}
+
+      {showGuestControls ? (
+        <section className="card">
+          <h2>Guest volume</h2>
+          <div className="guest-controls">
+            <button
+              type="button"
+              className="btn btn--ghost"
+              onClick={() => setGuestMuted((current) => !current)}
+            >
+              {guestMuted ? 'Unmute' : 'Mute'}
+            </button>
+            <div className="volume-row">
+              <span className="volume-label">Volume</span>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.01}
+                value={guestMuted ? 0 : guestVolume}
+                onChange={(event) => setGuestVolume(Number(event.target.value))}
+              />
             </div>
-          ) : (
-            <p className="hint">No track selected yet.</p>
-          )}
-        </div>
-        <div className="transport">
-          <button type="button" className="btn" onClick={handlePlay} disabled={!selectedTrack}>
-            Play
-          </button>
-          <button type="button" className="btn btn--ghost" onClick={handlePause} disabled={!selectedTrack}>
-            Pause
-          </button>
-          <button type="button" className="btn btn--ghost" onClick={handleStop} disabled={!selectedTrack}>
-            Stop
-          </button>
-        </div>
-        <input
-          type="range"
-          className="timeline"
-          min={0}
-          max={Math.max(1, hostDurationMs)}
-          value={Math.min(hostPositionMs, hostDurationMs)}
-          onChange={(event) => setHostPositionMs(Number(event.target.value))}
-          onMouseUp={() => handleSeek(hostPositionMs)}
-          onTouchEnd={() => handleSeek(hostPositionMs)}
-          disabled={!selectedTrack}
-        />
-        <div className="meta-row">
-          <span>Stream: {streamingTrackId ? 'Active' : 'Idle'}</span>
-          <span>Guest track: {guestTrackName || 'Waiting for stream'}</span>
-          <span>Clock offset: {clockOffsetMs.toFixed(0)}ms</span>
-        </div>
-      </section>
+          </div>
+        </section>
+      ) : null}
 
       <section className="card card--muted">
         <h2>Join a session</h2>
@@ -950,24 +1130,24 @@ function App() {
               const hostAddress = pickHostAddress(service)
               return (
                 <div key={`${service.name}-${service.port}`} className="session-item">
-                <div>
-                  <div className="session-title">{service.sessionCode ?? service.name}</div>
-                  <div className="session-meta">
-                    {hostAddress || 'Unknown host'}:{service.port}
+                  <div>
+                    <div className="session-title">{service.sessionCode ?? service.name}</div>
+                    <div className="session-meta">
+                      {hostAddress || 'Unknown host'}:{service.port}
+                    </div>
+                    <span className={`badge badge--${service.source}`}>
+                      {service.source.toUpperCase()}
+                    </span>
                   </div>
-                  <span className={`badge badge--${service.source}`}>
-                    {service.source.toUpperCase()}
-                  </span>
+                  <button
+                    type="button"
+                    className="btn btn--ghost"
+                    onClick={() => connectToHost(hostAddress, service.port)}
+                    disabled={!hostAddress}
+                  >
+                    Join
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  className="btn btn--ghost"
-                  onClick={() => connectToHost(hostAddress, service.port)}
-                  disabled={!hostAddress}
-                >
-                  Join
-                </button>
-              </div>
               )
             })}
           </div>

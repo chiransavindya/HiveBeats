@@ -8,6 +8,16 @@ export interface MdnsSessionAnnouncement {
   sessionCode?: string
 }
 
+type BonjourService = {
+  name: string
+  host?: string
+  port: number
+  addresses?: string[]
+  txt?: {
+    code?: string
+  }
+}
+
 const bonjour = new Bonjour()
 
 export function advertiseSession(sessionCode: string, port: number) {
@@ -27,7 +37,7 @@ export function startDiscovery(
 ) {
   const browser = bonjour.find({ type: 'hivebeats' })
 
-  const toAnnouncement = (service: any): MdnsSessionAnnouncement => ({
+  const toAnnouncement = (service: BonjourService): MdnsSessionAnnouncement => ({
     name: service.name,
     host: service.host,
     port: service.port,
@@ -35,8 +45,8 @@ export function startDiscovery(
     sessionCode: service.txt?.code,
   })
 
-  browser.on('up', (service: any) => onUp(toAnnouncement(service)))
-  browser.on('down', (service: any) => onDown(toAnnouncement(service)))
+  browser.on('up', (service: BonjourService) => onUp(toAnnouncement(service)))
+  browser.on('down', (service: BonjourService) => onDown(toAnnouncement(service)))
 
   return () => {
     try {

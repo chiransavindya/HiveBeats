@@ -1,5 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain } from 'electron'
-import { createRequire } from 'node:module'
+import { app, BrowserWindow, dialog, ipcMain, protocol } from 'electron'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import type { Service } from 'bonjour-service'
@@ -16,8 +15,20 @@ import {
 } from './socket'
 import { startBroadcast, startListener, stopBroadcast, stopListener } from './udp'
 
-const require = createRequire(import.meta.url)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'hivebeats',
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+    },
+  },
+])
 
 // The built directory structure
 //
@@ -45,8 +56,10 @@ let activeStream: StreamController | null = null
 let activeStreamTrackId: string | null = null
 
 function createWindow() {
+  const publicDir = process.env.VITE_PUBLIC ?? RENDERER_DIST
+
   win = new BrowserWindow({
-    icon: path.join(process.env.VITE_PUBLIC, 'electron-vite.svg'),
+    icon: path.join(publicDir, 'electron-vite.svg'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.mjs'),
     },
@@ -66,13 +79,13 @@ function createWindow() {
 }
 
 ipcMain.handle('mdns:advertise', (_event, payload: { sessionCode: string; port: number }) => {
-  advertisedService?.stop()
+  advertisedService?.stop?.()
   advertisedService = advertiseSession(payload.sessionCode, payload.port)
   return { ok: true }
 })
 
 ipcMain.handle('mdns:stop-advertise', () => {
-  advertisedService?.stop()
+  advertisedService?.stop?.()
   advertisedService = null
   return { ok: true }
 })
@@ -313,7 +326,7 @@ ipcMain.handle('udp:stop-listen', () => {
 // explicitly with Cmd + Q.
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
-    advertisedService?.stop()
+    advertisedService?.stop?.()
     stopDiscovery?.()
     stopBroadcast()
     stopUdpListener?.()
@@ -331,7 +344,23 @@ app.on('activate', () => {
   }
 })
 
-app.whenReady().then(createWindow)
+app.whenReady().then(() => {
+  protocol.registerFileProtocol('hivebeats', (request, callback) => {
+    try {
+      const url = new URL(request.url)
+      let filePath = decodeURIComponent(url.pathname)
+      const windowsPathMatch = filePath.match(/^\/([A-Za-z]:)/)
+      if (windowsPathMatch) {
+        filePath = filePath.slice(1)
+      }
+      callback({ path: filePath })
+    } catch {
+      callback({ error: -6 })
+    }
+  })
+
+  createWindow()
+})
 
 function safeParseJson(data: string) {
   try {

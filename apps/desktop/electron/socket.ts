@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import WebSocket, { WebSocketServer } from 'ws'
+import type { IncomingMessage } from 'node:http'
+import WebSocket, { WebSocketServer, type RawData } from 'ws'
 
 type HostClient = {
   id: string
@@ -31,7 +32,7 @@ export function startHost(port: number, handlers: HostHandlers) {
 
   server = new WebSocketServer({ port })
 
-  server.on('connection', (socket, request) => {
+  server.on('connection', (socket: WebSocket, request: IncomingMessage) => {
     const address = request.socket.remoteAddress ?? 'unknown'
     const client: HostClient = {
       id: randomUUID(),
@@ -42,7 +43,7 @@ export function startHost(port: number, handlers: HostHandlers) {
     clients.set(client.id, client)
     handlers.onClientConnected?.(client)
 
-    socket.on('message', (data) => {
+    socket.on('message', (data: RawData) => {
       handlers.onClientMessage?.(client, data.toString())
     })
 
@@ -51,12 +52,12 @@ export function startHost(port: number, handlers: HostHandlers) {
       handlers.onClientDisconnected?.(client)
     })
 
-    socket.on('error', (error) => {
+    socket.on('error', (error: Error) => {
       handlers.onHostError?.(error as Error)
     })
   })
 
-  server.on('error', (error) => {
+  server.on('error', (error: Error) => {
     handlers.onHostError?.(error as Error)
   })
 }
@@ -97,7 +98,7 @@ export function connectToHost(host: string, port: number, handlers: GuestHandler
     handlers.onConnected?.()
   })
 
-  guestSocket.on('message', (data) => {
+  guestSocket.on('message', (data: RawData) => {
     handlers.onMessage?.(data.toString())
   })
 
@@ -105,7 +106,7 @@ export function connectToHost(host: string, port: number, handlers: GuestHandler
     handlers.onDisconnected?.()
   })
 
-  guestSocket.on('error', (error) => {
+  guestSocket.on('error', (error: Error) => {
     handlers.onError?.(error as Error)
   })
 }

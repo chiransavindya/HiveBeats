@@ -17,6 +17,11 @@ export type StreamEndMessage = {
   trackId: string
 }
 
+export type StreamReadyMessage = {
+  type: 'STREAM_READY'
+  trackId: string
+}
+
 export type SyncPingMessage = {
   type: 'SYNC_PING'
   t0: number
@@ -53,6 +58,7 @@ export type StreamMessage =
   | StreamInitMessage
   | StreamChunkMessage
   | StreamEndMessage
+  | StreamReadyMessage
   | SyncPingMessage
   | SyncPongMessage
   | PlayCommandMessage

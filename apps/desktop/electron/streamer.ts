@@ -19,7 +19,8 @@ export function startFileStream(
   const stream = fs.createReadStream(filePath, { highWaterMark: chunkSize })
 
   stream.on('data', (chunk) => {
-    callbacks.onChunk(chunk, sequence)
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    callbacks.onChunk(buffer, sequence)
     sequence += 1
   })
 
