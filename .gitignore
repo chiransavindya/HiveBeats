@@ -14,7 +14,7 @@ build/
 .turbo/
 **/package-lock.json
 docs/
-apps/desktop/re
+apps/desktop/release/
 
 # Supabase local
 supabase/.temp/
