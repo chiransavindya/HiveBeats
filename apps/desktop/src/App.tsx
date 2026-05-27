@@ -11,6 +11,8 @@ import type { UdpAnnouncement } from './types/udp'
 import type {
   PauseCommandMessage,
   PlayCommandMessage,
+  ReadyAckMessage,
+  ReadyRequestMessage,
   SeekCommandMessage,
   StreamChunkMessage,
   StreamEndMessage,
@@ -33,6 +35,7 @@ type GuestInfo = {
   id: string
   alias: string
   address: string
+  ready: boolean
 }
 
 type LogEntry = {
@@ -46,6 +49,17 @@ type TrackSelection = {
   fileName: string
   mimeType: string
 }
+
+// Extended command messages with sequence number
+type ExtendedPlayCommand = PlayCommandMessage & { seq: number; epoch: number }
+type ExtendedPauseCommand = PauseCommandMessage & { seq: number; epoch: number }
+type ExtendedSeekCommand = SeekCommandMessage & { seq: number; epoch: number }
+
+const SYNC_INTERVAL_MS = 5000
+const HOST_PLAY_DELAY_MS = 1200
+const HOST_PAUSE_DELAY_MS = 80
+const GUEST_READY_BUFFER_SECONDS = 2.5
+const GUEST_READY_POSITION_TOLERANCE_SECONDS = 0.15
 
 function App() {
   const [sessionCode, setSessionCode] = useState(() => generateSessionCode())
@@ -73,6 +87,8 @@ function App() {
   const [guestMuted, setGuestMuted] = useState(false)
   const [guestStreamReady, setGuestStreamReady] = useState(false)
   const [guestSyncReady, setGuestSyncReady] = useState(false)
+  const [guestReadyRequested, setGuestReadyRequested] = useState(false)
+  const [guestReadyAcknowledged, setGuestReadyAcknowledged] = useState(false)
   const [pendingPlay, setPendingPlay] = useState(false)
   const [hostPortInput, setHostPortInput] = useState('7400')
   const [joinPortInput, setJoinPortInput] = useState('7400')
@@ -80,16 +96,16 @@ function App() {
   const [mdnsEnabled, setMdnsEnabled] = useState(true)
   const [udpEnabled, setUdpEnabled] = useState(true)
   const [retryEnabled, setRetryEnabled] = useState(true)
-  const [connectionTarget, setConnectionTarget] = useState<{
-    host: string
-    port: number
-  } | null>(null)
+  const [connectionTarget, setConnectionTarget] = useState<{ host: string; port: number } | null>(null)
   const [retryCount, setRetryCount] = useState(0)
 
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const syncTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const hostPlayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hostPauseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const guestPlayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const guestPauseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const guestSeekTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hostAudioRef = useRef<HTMLAudioElement | null>(null)
   const guestAudioRef = useRef<HTMLAudioElement | null>(null)
   const mediaSourceRef = useRef<MediaSource | null>(null)
@@ -98,11 +114,19 @@ function App() {
   const streamEndPendingRef = useRef(false)
   const guestBufferedBytesRef = useRef(0)
   const guestReadySentRef = useRef(false)
+  const guestReadyRequestedRef = useRef(false)
+  const guestReadyAcknowledgedRef = useRef(false)
   const pendingPlayRef = useRef(false)
   const guestStreamReadyRef = useRef(false)
   const guestSyncReadyRef = useRef(false)
+  const guestTrackIdRef = useRef<string | null>(null)
+  const guestReadyPositionMsRef = useRef(0)
   const clockOffsetRef = useRef(0)
   const pendingPlaybackPositionRef = useRef(0)
+  const guestReadyIdsRef = useRef<Set<string>>(new Set())
+  const hostCommandSeqRef = useRef(0)
+  const guestLastCommandIdRef = useRef(-1)
+  const transportEpochRef = useRef(0)
 
   const hostPort = Number(hostPortInput) || 7400
   const joinPort = Number(joinPortInput) || hostPort
@@ -113,6 +137,327 @@ function App() {
   const showGuestControls = guestConnected && !hostRunning
   const deviceId = useMemo(() => crypto.randomUUID(), [])
   const deviceAlias = useMemo(() => `Desktop-${deviceId.slice(0, 4)}`, [deviceId])
+
+  const addLog = useCallback((message: string) => {
+    setLogs((current) => [{ id: crypto.randomUUID(), message }, ...current].slice(0, 6))
+  }, [])
+
+  const formatTime = (ms: number) => {
+    if (!Number.isFinite(ms)) return '0:00'
+    const totalSeconds = Math.floor(ms / 1000)
+    const minutes = Math.floor(totalSeconds / 60)
+    const seconds = totalSeconds % 60
+    return `${minutes}:${seconds.toString().padStart(2, '0')}`
+  }
+
+  const filePathToUrl = (filePath: string) => {
+    const normalized = filePath.replace(/\\/g, '/')
+    const withLeadingSlash = normalized.startsWith('/') ? normalized : `/${normalized}`
+    return `hivebeats://file${withLeadingSlash}`
+  }
+
+  const decodeBase64 = (data: string) => {
+    const binary = atob(data)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+    return bytes
+  }
+
+  const getBufferedAhead = useCallback((audio: HTMLAudioElement, positionSeconds: number) => {
+    for (let index = 0; index < audio.buffered.length; index += 1) {
+      const start = audio.buffered.start(index)
+      const end = audio.buffered.end(index)
+      if (
+        start <= positionSeconds + GUEST_READY_POSITION_TOLERANCE_SECONDS &&
+        end > positionSeconds
+      ) {
+        return end - positionSeconds
+      }
+    }
+
+    return 0
+  }, [])
+
+  const appendNextChunk = useCallback(() => {
+    const sourceBuffer = sourceBufferRef.current
+    if (!sourceBuffer || sourceBuffer.updating) return
+
+    const chunk = chunkQueueRef.current.shift()
+    if (chunk) {
+      sourceBuffer.appendBuffer(Uint8Array.from(chunk).buffer)
+      return
+    }
+
+    if (streamEndPendingRef.current && mediaSourceRef.current?.readyState === 'open') {
+      streamEndPendingRef.current = false
+      mediaSourceRef.current.endOfStream()
+    }
+  }, [])
+
+  const areAllGuestsReady = useCallback((readyIds: Set<string>, guests: GuestInfo[]) => {
+    if (guests.length === 0) return true
+    return guests.every((guest) => readyIds.has(guest.id))
+  }, [])
+
+  const nextTransportEpoch = useCallback(() => {
+    transportEpochRef.current += 1
+    return transportEpochRef.current
+  }, [])
+
+  // Clear all host transport timers
+  const clearHostTransportTimers = useCallback(() => {
+    if (hostPlayTimerRef.current) {
+      clearTimeout(hostPlayTimerRef.current)
+      hostPlayTimerRef.current = null
+    }
+    if (hostPauseTimerRef.current) {
+      clearTimeout(hostPauseTimerRef.current)
+      hostPauseTimerRef.current = null
+    }
+  }, [])
+
+  // Clear all guest transport timers
+  const clearGuestTransportTimers = useCallback(() => {
+    if (guestPlayTimerRef.current) {
+      clearTimeout(guestPlayTimerRef.current)
+      guestPlayTimerRef.current = null
+    }
+    if (guestPauseTimerRef.current) {
+      clearTimeout(guestPauseTimerRef.current)
+      guestPauseTimerRef.current = null
+    }
+    if (guestSeekTimerRef.current) {
+      clearTimeout(guestSeekTimerRef.current)
+      guestSeekTimerRef.current = null
+    }
+  }, [])
+
+  const startPlayback = useCallback(
+    (positionMs: number, epoch = nextTransportEpoch()) => {
+      if (!selectedTrack) return
+
+      clearHostTransportTimers()
+
+      const seq = hostCommandSeqRef.current++
+      const playAt = Date.now() + HOST_PLAY_DELAY_MS
+      const command: ExtendedPlayCommand = {
+        type: 'CMD_PLAY',
+        trackId: selectedTrack.id,
+        playAt,
+        positionMs,
+        seq,
+        epoch,
+      }
+
+      const audio = hostAudioRef.current
+      if (!audio) return
+
+      audio.muted = false
+      audio.volume = 1
+
+      void window.hivebeats.broadcastToGuests(command)
+      hostPlayTimerRef.current = setTimeout(() => {
+        if (transportEpochRef.current !== epoch) return
+        audio.play().catch(() => {
+          setHostError('Unable to start playback. Try again.')
+        })
+      }, Math.max(0, playAt - Date.now()))
+
+      setHostPlaying(true)
+      setPendingPlay(false)
+      pendingPlayRef.current = false
+    },
+    [nextTransportEpoch, selectedTrack, clearHostTransportTimers],
+  )
+
+  const scheduleHostPause = useCallback((pauseAt: number, epoch: number) => {
+    const audio = hostAudioRef.current
+    if (!audio) return
+    hostPauseTimerRef.current = setTimeout(() => {
+      if (transportEpochRef.current !== epoch) return
+      audio.pause()
+      setHostPlaying(false)
+    }, Math.max(0, pauseAt - Date.now()))
+  }, [])
+
+  const resetHostReadiness = useCallback(() => {
+    guestReadyIdsRef.current.clear()
+    setGuestList((current) => current.map((guest) => ({ ...guest, ready: false })))
+    setGuestReadyRequested(false)
+    setGuestReadyAcknowledged(false)
+  }, [])
+
+  const maybeStartPendingPlayback = useCallback(() => {
+    if (!pendingPlayRef.current) return
+    if (!areAllGuestsReady(guestReadyIdsRef.current, guestList)) return
+
+    pendingPlayRef.current = false
+    setPendingPlay(false)
+    const audio = hostAudioRef.current
+    const positionMs = audio ? audio.currentTime * 1000 : pendingPlaybackPositionRef.current
+    startPlayback(positionMs)
+  }, [areAllGuestsReady, guestList, startPlayback])
+
+  const sendPlayToGuest = useCallback(
+    async (clientId: string, positionMs: number) => {
+      if (!selectedTrack) return
+
+      const epoch = nextTransportEpoch()
+      const playAt = Date.now() + HOST_PLAY_DELAY_MS
+      const command: ExtendedPlayCommand = {
+        type: 'CMD_PLAY',
+        trackId: selectedTrack.id,
+        playAt,
+        positionMs,
+        seq: hostCommandSeqRef.current++,
+        epoch,
+      }
+
+      await window.hivebeats.sendToGuest(clientId, command)
+    },
+    [nextTransportEpoch, selectedTrack],
+  )
+
+  const requestGuestReadyAt = useCallback(
+    async (clientId: string, positionMs: number) => {
+      if (!selectedTrack) return
+
+      const message: ReadyRequestMessage = {
+        type: 'READY_REQUEST',
+        trackId: selectedTrack.id,
+        positionMs,
+      }
+
+      guestReadyIdsRef.current.delete(clientId)
+      setGuestList((current) =>
+        current.map((guest) => (guest.id === clientId ? { ...guest, ready: false } : guest)),
+      )
+      await window.hivebeats.sendToGuest(clientId, message)
+    },
+    [selectedTrack],
+  )
+
+  const requestGuestReady = useCallback(async () => {
+    if (!selectedTrack) return
+    if (guestCount <= 0) return
+
+    const audio = hostAudioRef.current
+    const positionMs = audio ? audio.currentTime * 1000 : 0
+    const message: ReadyRequestMessage = {
+      type: 'READY_REQUEST',
+      trackId: selectedTrack.id,
+      positionMs,
+    }
+
+    resetHostReadiness()
+    await window.hivebeats.broadcastToGuests(message)
+    addLog('Requested guests to get ready')
+  }, [addLog, guestCount, resetHostReadiness, selectedTrack])
+
+  const checkGuestReady = useCallback(() => {
+    if (guestReadySentRef.current) return
+    const audio = guestAudioRef.current
+    if (!audio || audio.buffered.length === 0) return
+
+    const targetSeconds = guestReadyPositionMsRef.current / 1000
+    const bufferedAhead = getBufferedAhead(audio, targetSeconds)
+    if (bufferedAhead < GUEST_READY_BUFFER_SECONDS) return
+
+    if (Math.abs(audio.currentTime - targetSeconds) > GUEST_READY_POSITION_TOLERANCE_SECONDS) {
+      audio.currentTime = targetSeconds
+      return
+    }
+
+    if (audio.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return
+
+    if (bufferedAhead >= GUEST_READY_BUFFER_SECONDS) {
+      guestReadySentRef.current = true
+      guestStreamReadyRef.current = true
+      setGuestStreamReady(true)
+      addLog(`Guest ready at ${formatTime(guestReadyPositionMsRef.current)}`)
+    }
+  }, [addLog, getBufferedAhead])
+
+  const trySendReadyAck = useCallback(async () => {
+    if (!guestReadyRequestedRef.current) return
+    if (!guestStreamReadyRef.current || !guestSyncReadyRef.current) return
+    if (guestReadyAcknowledgedRef.current) return
+
+    const audio = guestAudioRef.current
+    if (!audio) return
+
+    const message: ReadyAckMessage = {
+      type: 'READY_ACK',
+      trackId: guestTrackIdRef.current ?? 'unknown',
+      positionMs: audio.currentTime * 1000,
+    }
+
+    await window.hivebeats.sendToHost(message)
+    guestReadyAcknowledgedRef.current = true
+    setGuestReadyAcknowledged(true)
+    setGuestError(null)
+    addLog('Ready sent to host')
+  }, [addLog])
+
+  const resetGuestStream = useCallback(
+    (mimeType: string, fileName: string) => {
+      const audio = guestAudioRef.current
+      if (!audio) return
+
+      // Reset guest timer and command sequence
+      clearGuestTransportTimers()
+      guestLastCommandIdRef.current = -1
+
+      mediaSourceRef.current = null
+      sourceBufferRef.current = null
+      chunkQueueRef.current = []
+      streamEndPendingRef.current = false
+      guestBufferedBytesRef.current = 0
+      guestReadySentRef.current = false
+      guestReadyAcknowledgedRef.current = false
+      guestStreamReadyRef.current = false
+      guestSyncReadyRef.current = false
+      guestTrackIdRef.current = null
+      setGuestStreamReady(false)
+      setGuestSyncReady(false)
+      setGuestReadyAcknowledged(false)
+      setGuestTrackName(fileName)
+
+      const mediaSource = new MediaSource()
+      mediaSourceRef.current = mediaSource
+      audio.src = URL.createObjectURL(mediaSource)
+
+      mediaSource.addEventListener('sourceopen', () => {
+        if (!mediaSourceRef.current || mediaSourceRef.current.readyState !== 'open') return
+        try {
+          const sourceBuffer = mediaSource.addSourceBuffer(mimeType)
+          sourceBufferRef.current = sourceBuffer
+          sourceBuffer.addEventListener('updateend', () => {
+            appendNextChunk()
+            checkGuestReady()
+            void trySendReadyAck()
+          })
+          appendNextChunk()
+        } catch {
+          setGuestError('Stream mime type not supported on this device.')
+        }
+      })
+    },
+    [appendNextChunk, checkGuestReady, clearGuestTransportTimers, trySendReadyAck],
+  )
+
+  const handleGuestReady = async () => {
+    if (!guestSyncReadyRef.current) {
+      await window.hivebeats.sendToHost({ type: 'SYNC_PING', t0: Date.now() })
+    }
+    checkGuestReady()
+    await trySendReadyAck()
+  }
+
+  const pickHostAddress = (session: DiscoveredSession) => {
+    const ipv4 = session.addresses.find((address) => /^\d{1,3}(\.\d{1,3}){3}$/.test(address))
+    return ipv4 ?? session.host ?? ''
+  }
 
   const discovered = useMemo<DiscoveredSession[]>(() => {
     const mdnsSessions = mdnsDiscovered.map((service) => ({
@@ -139,18 +484,8 @@ function App() {
     })
 
     const all = Array.from(unique.values())
-    if (hostRunning) {
-      return all.filter((session) => session.sessionCode !== sessionCode)
-    }
-    return all
+    return hostRunning ? all.filter((session) => session.sessionCode !== sessionCode) : all
   }, [hostRunning, mdnsDiscovered, sessionCode, udpDiscovered])
-
-  const addLog = useCallback((message: string) => {
-    setLogs((current) => {
-      const entry = { id: crypto.randomUUID(), message }
-      return [entry, ...current].slice(0, 6)
-    })
-  }, [])
 
   const attemptConnect = useCallback(
     async (host: string, port: number, label: string) => {
@@ -160,126 +495,40 @@ function App() {
     [addLog],
   )
 
-  const formatTime = (ms: number) => {
-    if (!Number.isFinite(ms)) return '0:00'
-    const totalSeconds = Math.floor(ms / 1000)
-    const minutes = Math.floor(totalSeconds / 60)
-    const seconds = totalSeconds % 60
-    return `${minutes}:${seconds.toString().padStart(2, '0')}`
-  }
-
-  const filePathToUrl = (filePath: string) => {
-    const normalized = filePath.replace(/\\/g, '/')
-    const withLeadingSlash = normalized.startsWith('/') ? normalized : `/${normalized}`
-    return `hivebeats://file${withLeadingSlash}`
-  }
-
-  const decodeBase64 = (data: string) => {
-    const binary = atob(data)
-    const bytes = new Uint8Array(binary.length)
-    for (let i = 0; i < binary.length; i += 1) {
-      bytes[i] = binary.charCodeAt(i)
-    }
-    return bytes
-  }
-
-  const appendNextChunk = useCallback(() => {
-    const sourceBuffer = sourceBufferRef.current
-    if (!sourceBuffer || sourceBuffer.updating) return
-    const chunk = chunkQueueRef.current.shift()
-    if (chunk) {
-      const buffer = Uint8Array.from(chunk).buffer
-      sourceBuffer.appendBuffer(buffer)
+  const connectToHost = async (host: string, port: number) => {
+    if (!host) {
+      setGuestError('Missing host address. Try manual IP entry.')
       return
     }
-    if (streamEndPendingRef.current && mediaSourceRef.current?.readyState === 'open') {
-      streamEndPendingRef.current = false
-      mediaSourceRef.current.endOfStream()
-    }
-  }, [])
-
-  const checkGuestReady = useCallback(() => {
-    if (guestReadySentRef.current) return
-    const audio = guestAudioRef.current
-    if (!audio || audio.buffered.length === 0) return
-    const bufferedEnd = audio.buffered.end(audio.buffered.length - 1)
-    const bufferedAhead = bufferedEnd - audio.currentTime
-    if (bufferedAhead >= 2.5) {
-      guestReadySentRef.current = true
-      guestStreamReadyRef.current = true
-      setGuestStreamReady(true)
-      window.hivebeats.sendToHost({
-        type: 'STREAM_READY',
-        trackId: guestTrackId ?? 'unknown',
-      })
-    }
-  }, [guestTrackId])
-
-  const scheduleHostPlay = (playAt: number) => {
-    const audio = hostAudioRef.current
-    if (!audio) return
-    if (hostPlayTimerRef.current) {
-      clearTimeout(hostPlayTimerRef.current)
-    }
-    const delay = Math.max(0, playAt - Date.now())
-    hostPlayTimerRef.current = setTimeout(() => {
-      audio.play().catch(() => {
-        setHostError('Unable to start playback. Try again.')
-      })
-    }, delay)
+    setConnectionTarget({ host, port })
+    setRetryCount(0)
+    setGuestError(null)
+    await attemptConnect(host, port, 'Connecting to')
   }
 
-  const scheduleHostPause = (pauseAt: number) => {
-    const audio = hostAudioRef.current
-    if (!audio) return
-    if (hostPauseTimerRef.current) {
-      clearTimeout(hostPauseTimerRef.current)
-    }
-    const delay = Math.max(0, pauseAt - Date.now())
-    hostPauseTimerRef.current = setTimeout(() => {
-      audio.pause()
-      setHostPlaying(false)
+  const scheduleRetry = useCallback(() => {
+    if (!retryEnabled || !connectionTarget) return
+    if (retryCount >= maxRetries) return
+    if (retryTimerRef.current) return
+
+    const nextAttempt = retryCount + 1
+    const delay = 800 * 2 ** retryCount
+
+    retryTimerRef.current = setTimeout(() => {
+      retryTimerRef.current = null
+      setRetryCount(nextAttempt)
+      attemptConnect(connectionTarget.host, connectionTarget.port, `Retry ${nextAttempt}/${maxRetries} to`)
     }, delay)
-  }
+  }, [attemptConnect, connectionTarget, maxRetries, retryCount, retryEnabled])
 
-  const resetGuestStream = useCallback(
-    (mimeType: string, fileName: string) => {
-      const audio = guestAudioRef.current
-      if (!audio) return
-
-      if (mediaSourceRef.current) {
-        mediaSourceRef.current = null
-      }
-
-      chunkQueueRef.current = []
-      streamEndPendingRef.current = false
-      guestBufferedBytesRef.current = 0
-      guestReadySentRef.current = false
-      guestStreamReadyRef.current = false
-      setGuestStreamReady(false)
-      setGuestTrackName(fileName)
-
-      const mediaSource = new MediaSource()
-      mediaSourceRef.current = mediaSource
-      audio.src = URL.createObjectURL(mediaSource)
-
-      mediaSource.addEventListener('sourceopen', () => {
-        if (!mediaSourceRef.current || mediaSourceRef.current.readyState !== 'open') return
-        try {
-          const sourceBuffer = mediaSource.addSourceBuffer(mimeType)
-          sourceBufferRef.current = sourceBuffer
-          sourceBuffer.addEventListener('updateend', () => {
-            appendNextChunk()
-            checkGuestReady()
-          })
-          appendNextChunk()
-        } catch {
-          setGuestError('Stream mime type not supported on this device.')
-        }
-      })
-    },
-    [appendNextChunk, checkGuestReady],
-  )
+  const sendHello = useCallback(async () => {
+    const message: HostHelloMessage = {
+      type: 'HELLO',
+      deviceId,
+      alias: deviceAlias,
+    }
+    await window.hivebeats.sendToHost(message)
+  }, [deviceAlias, deviceId])
 
   const handleNewCode = () => {
     setSessionCode(generateSessionCode())
@@ -298,6 +547,7 @@ function App() {
 
     setSelectedTrack(track)
     setStreamingTrackId(null)
+    resetHostReadiness()
 
     const audio = hostAudioRef.current
     if (audio) {
@@ -310,45 +560,13 @@ function App() {
     addLog(`Loaded ${result.fileName}`)
   }
 
-  const startPlayback = useCallback(
-    async (positionMs: number) => {
-      if (!selectedTrack) return
-      const playAt = Date.now() + 800
-      const command: PlayCommandMessage = {
-        type: 'CMD_PLAY',
-        trackId: selectedTrack.id,
-        playAt,
-        positionMs,
-      }
-
-      await window.hivebeats.broadcastToGuests(command)
-      const audio = hostAudioRef.current
-      if (!audio) return
-      audio.muted = false
-      audio.volume = 1
-      scheduleHostPlay(playAt)
-      setHostPlaying(true)
-      setPendingPlay(false)
-      pendingPlayRef.current = false
-    },
-    [selectedTrack],
-  )
-
-  const maybeStartPendingPlayback = useCallback(() => {
-    if (!pendingPlayRef.current) return
-    if (!guestStreamReadyRef.current) return
-    if (!guestSyncReadyRef.current) return
-
-    pendingPlayRef.current = false
-    setPendingPlay(false)
-    startPlayback(pendingPlaybackPositionRef.current)
-  }, [startPlayback])
-
   const handlePlay = async () => {
     if (!selectedTrack) {
       setHostError('Pick an audio file first.')
       return
     }
+
+    if (hostPlaying) return
 
     const audio = hostAudioRef.current
     if (!audio) return
@@ -366,58 +584,72 @@ function App() {
 
     const positionMs = audio.currentTime * 1000
 
-    if (guestCount > 0 && (!guestStreamReadyRef.current || !guestSyncReadyRef.current)) {
+    if (guestCount > 0 && !areAllGuestsReady(guestReadyIdsRef.current, guestList)) {
       setPendingPlay(true)
       pendingPlayRef.current = true
       pendingPlaybackPositionRef.current = positionMs
-      addLog('Buffering guest before play...')
-      setTimeout(() => {
-        if (pendingPlayRef.current) {
-          startPlayback(positionMs)
-        }
-      }, 1500)
+      addLog('Waiting for guests to become ready...')
+      await requestGuestReady()
       return
     }
 
-    await startPlayback(positionMs)
+    startPlayback(positionMs)
   }
 
   const handlePause = async () => {
     const audio = hostAudioRef.current
     if (!audio) return
 
-    const pauseAt = Date.now() + 200
+    const epoch = nextTransportEpoch()
+    const seq = hostCommandSeqRef.current++
+    const pauseAt = Date.now() + HOST_PAUSE_DELAY_MS
     const positionMs = audio.currentTime * 1000
 
-    const command: PauseCommandMessage = {
+    clearHostTransportTimers()
+    setPendingPlay(false)
+    pendingPlayRef.current = false
+
+    setHostPlaying(false)
+
+    const command: ExtendedPauseCommand = {
       type: 'CMD_PAUSE',
       pauseAt,
       positionMs,
+      seq,
+      epoch,
     }
 
     await window.hivebeats.broadcastToGuests(command)
-    scheduleHostPause(pauseAt)
+    scheduleHostPause(pauseAt, epoch)
   }
 
   const handleStop = async () => {
     const audio = hostAudioRef.current
     if (!audio) return
+
+    const epoch = nextTransportEpoch()
+    clearHostTransportTimers()
+
     audio.pause()
     audio.currentTime = 0
     setHostPlaying(false)
     setHostPositionMs(0)
     setStreamingTrackId(null)
-    await window.hivebeats.stopStream()
     setPendingPlay(false)
     pendingPlayRef.current = false
 
-    const command: PauseCommandMessage = {
+    await window.hivebeats.stopStream()
+
+    const command: ExtendedPauseCommand = {
       type: 'CMD_PAUSE',
       pauseAt: Date.now(),
       positionMs: 0,
+      seq: hostCommandSeqRef.current++,
+      epoch,
     }
 
     await window.hivebeats.broadcastToGuests(command)
+    resetHostReadiness()
   }
 
   const handleSeek = async (positionMs: number) => {
@@ -425,20 +657,26 @@ function App() {
     const audio = hostAudioRef.current
     if (!audio) return
 
-    const playAt = Date.now() + 800
+    const epoch = nextTransportEpoch()
+    const seq = hostCommandSeqRef.current++
+    const playAt = Date.now() + HOST_PLAY_DELAY_MS
     audio.currentTime = positionMs / 1000
 
-    const command: SeekCommandMessage = {
+    const command: ExtendedSeekCommand = {
       type: 'CMD_SEEK',
       trackId: selectedTrack.id,
       playAt,
       positionMs,
+      seq,
+      epoch,
     }
 
+    clearHostTransportTimers()
+    setPendingPlay(false)
+    pendingPlayRef.current = false
+
     await window.hivebeats.broadcastToGuests(command)
-    if (hostPlaying) {
-      scheduleHostPlay(playAt)
-    }
+    resetHostReadiness()
   }
 
   const handleStartHost = async () => {
@@ -447,13 +685,7 @@ function App() {
       await window.hivebeats.advertiseSession(sessionCode, hostPort)
     }
     if (udpEnabled) {
-      await window.hivebeats.startUdpBroadcast(
-        sessionCode,
-        hostPort,
-        broadcastPort,
-        broadcastIntervalMs,
-        deviceId,
-      )
+      await window.hivebeats.startUdpBroadcast(sessionCode, hostPort, broadcastPort, broadcastIntervalMs, deviceId)
     }
     setHostRunning(true)
     setHostError(null)
@@ -461,6 +693,8 @@ function App() {
   }
 
   const handleStopHost = async () => {
+    nextTransportEpoch()
+    clearHostTransportTimers()
     await window.hivebeats.stopHost()
     await window.hivebeats.stopAdvertise()
     await window.hivebeats.stopUdpBroadcast()
@@ -469,30 +703,14 @@ function App() {
     setGuestCount(0)
     setGuestList([])
     setStreamingTrackId(null)
+    setPendingPlay(false)
+    pendingPlayRef.current = false
+    guestReadyIdsRef.current.clear()
     addLog('Host stopped')
   }
 
-  const sendHello = useCallback(async () => {
-    const message: HostHelloMessage = {
-      type: 'HELLO',
-      deviceId,
-      alias: deviceAlias,
-    }
-    await window.hivebeats.sendToHost(message)
-  }, [deviceAlias, deviceId])
-
-  const connectToHost = async (host: string, port: number) => {
-    if (!host) {
-      setGuestError('Missing host address. Try manual IP entry.')
-      return
-    }
-    setConnectionTarget({ host, port })
-    setRetryCount(0)
-    setGuestError(null)
-    await attemptConnect(host, port, 'Connecting to')
-  }
-
   const handleDisconnect = async () => {
+    clearGuestTransportTimers()
     await window.hivebeats.disconnectFromHost()
     setConnectionTarget(null)
     setRetryCount(0)
@@ -501,26 +719,6 @@ function App() {
       retryTimerRef.current = null
     }
     addLog('Guest disconnected manually')
-  }
-
-  const scheduleRetry = useCallback(() => {
-    if (!retryEnabled || !connectionTarget) return
-    if (retryCount >= maxRetries) return
-    if (retryTimerRef.current) return
-
-    const nextAttempt = retryCount + 1
-    const delay = 800 * 2 ** retryCount
-
-    retryTimerRef.current = setTimeout(() => {
-      retryTimerRef.current = null
-      setRetryCount(nextAttempt)
-      attemptConnect(connectionTarget.host, connectionTarget.port, `Retry ${nextAttempt}/${maxRetries} to`)
-    }, delay)
-  }, [attemptConnect, connectionTarget, maxRetries, retryCount, retryEnabled])
-
-  const pickHostAddress = (session: DiscoveredSession) => {
-    const ipv4 = session.addresses.find((address) => /^\d{1,3}(\.\d{1,3}){3}$/.test(address))
-    return ipv4 ?? session.host ?? ''
   }
 
   useEffect(() => {
@@ -536,9 +734,7 @@ function App() {
         setMdnsDiscovered((current) => {
           const key = toKey(service)
           const exists = current.some((item) => toKey(item) === key)
-          if (!exists) {
-            addLog(`mDNS: ${service.sessionCode ?? service.name} found`)
-          }
+          if (!exists) addLog(`mDNS: ${service.sessionCode ?? service.name} found`)
           const filtered = current.filter((item) => toKey(item) !== key)
           return [...filtered, service]
         })
@@ -560,9 +756,7 @@ function App() {
         setUdpDiscovered((current) => {
           const key = `${announcement.code}-${announcement.host}-${announcement.port}`
           const exists = current.some((item) => `${item.code}-${item.host}-${item.port}` === key)
-          if (!exists) {
-            addLog(`UDP: ${announcement.code} at ${announcement.host}`)
-          }
+          if (!exists) addLog(`UDP: ${announcement.code} at ${announcement.host}`)
           const filtered = current.filter((item) => `${item.code}-${item.host}-${item.port}` !== key)
           return [...filtered, announcement]
         })
@@ -593,14 +787,8 @@ function App() {
     const audio = hostAudioRef.current
     if (!audio) return
 
-    const handleTimeUpdate = () => {
-      setHostPositionMs(audio.currentTime * 1000)
-    }
-
-    const handleLoadedMetadata = () => {
-      setHostDurationMs(audio.duration * 1000)
-    }
-
+    const handleTimeUpdate = () => setHostPositionMs(audio.currentTime * 1000)
+    const handleLoadedMetadata = () => setHostDurationMs(audio.duration * 1000)
     const handleEnded = () => {
       setHostPlaying(false)
       setHostPositionMs(0)
@@ -625,7 +813,7 @@ function App() {
       }
 
       sendPing()
-      syncTimerRef.current = setInterval(sendPing, 30000)
+      syncTimerRef.current = setInterval(sendPing, SYNC_INTERVAL_MS)
     }
 
     return () => {
@@ -643,6 +831,28 @@ function App() {
   }, [guestMuted, guestVolume])
 
   useEffect(() => {
+    const audio = guestAudioRef.current
+    if (!audio) return
+
+    const handleGuestCanPlay = () => {
+      checkGuestReady()
+      void trySendReadyAck()
+    }
+
+    audio.addEventListener('canplay', handleGuestCanPlay)
+    audio.addEventListener('seeked', handleGuestCanPlay)
+    audio.addEventListener('loadedmetadata', handleGuestCanPlay)
+    audio.addEventListener('progress', handleGuestCanPlay)
+
+    return () => {
+      audio.removeEventListener('canplay', handleGuestCanPlay)
+      audio.removeEventListener('seeked', handleGuestCanPlay)
+      audio.removeEventListener('loadedmetadata', handleGuestCanPlay)
+      audio.removeEventListener('progress', handleGuestCanPlay)
+    }
+  }, [checkGuestReady, trySendReadyAck])
+
+  useEffect(() => {
     if (!hostRunning) return
 
     if (mdnsEnabled) {
@@ -652,13 +862,7 @@ function App() {
     }
 
     if (udpEnabled) {
-      window.hivebeats.startUdpBroadcast(
-        sessionCode,
-        hostPort,
-        broadcastPort,
-        broadcastIntervalMs,
-        deviceId,
-      )
+      window.hivebeats.startUdpBroadcast(sessionCode, hostPort, broadcastPort, broadcastIntervalMs, deviceId)
     } else {
       window.hivebeats.stopUdpBroadcast()
     }
@@ -672,14 +876,21 @@ function App() {
           setGuestList((current) => {
             if (!status.address || !status.clientId) return current
             if (current.some((guest) => guest.id === status.clientId)) return current
-            return [...current, { id: status.clientId, alias: 'Guest', address: status.address }]
+            return [...current, { id: status.clientId, alias: 'Guest', address: status.address, ready: false }]
           })
+          if (status.clientId) {
+            guestReadyIdsRef.current.delete(status.clientId)
+          }
           addLog(`Guest connected (${status.address})`)
         }
         if (status.status === 'client-disconnected') {
           setGuestCount((count) => Math.max(0, count - 1))
           setGuestList((current) => current.filter((guest) => guest.id !== status.clientId))
+          if (status.clientId) {
+            guestReadyIdsRef.current.delete(status.clientId)
+          }
           addLog('Guest disconnected')
+          maybeStartPendingPlayback()
         }
         if (status.status === 'error') {
           setHostError(status.message)
@@ -692,6 +903,8 @@ function App() {
           setGuestConnected(true)
           setGuestSyncReady(false)
           guestSyncReadyRef.current = false
+          guestReadyRequestedRef.current = false
+          guestReadyAcknowledgedRef.current = false
           setGuestError(null)
           sendHello()
           addLog('Guest connected to host')
@@ -706,6 +919,10 @@ function App() {
           setGuestHostId('')
           setGuestSyncReady(false)
           guestSyncReadyRef.current = false
+          guestReadyRequestedRef.current = false
+          guestReadyAcknowledgedRef.current = false
+          setGuestReadyRequested(false)
+          setGuestReadyAcknowledged(false)
           addLog('Guest disconnected from host')
           scheduleRetry()
         }
@@ -721,6 +938,7 @@ function App() {
       if (payload.role === 'host' && typeof payload.message === 'object' && payload.message) {
         const message = payload.message as HostHelloMessage
         if (message.type === 'HELLO' && payload.clientId) {
+          const clientId = payload.clientId
           const reply: HostWelcomeMessage = {
             type: 'WELCOME',
             sessionCode,
@@ -728,15 +946,31 @@ function App() {
           }
           setGuestList((current) =>
             current.map((guest) =>
-              guest.id === payload.clientId
+              guest.id === clientId
                 ? { ...guest, alias: message.alias }
                 : guest,
             ),
           )
-          window.hivebeats.sendToGuest(payload.clientId, reply)
+          window.hivebeats.sendToGuest(clientId, reply)
+
+          if (selectedTrack) {
+            void window.hivebeats
+              .startStreamForGuest(
+                clientId,
+                selectedTrack.filePath,
+                selectedTrack.fileName,
+                selectedTrack.mimeType,
+                selectedTrack.id,
+              )
+              .then(() => {
+                const audio = hostAudioRef.current
+                const positionMs = audio ? audio.currentTime * 1000 : 0
+                void requestGuestReadyAt(clientId, positionMs)
+              })
+          }
         }
 
-        const streamMessage = payload.message as StreamMessage
+        const streamMessage = payload.message as StreamMessage | ReadyAckMessage
         if (streamMessage.type === 'SYNC_PING' && payload.clientId) {
           const t1 = Date.now()
           const pong: SyncPongMessage = {
@@ -748,15 +982,20 @@ function App() {
           window.hivebeats.sendToGuest(payload.clientId, pong)
         }
 
-        if (streamMessage.type === 'STREAM_READY') {
-          setGuestStreamReady(true)
-          guestStreamReadyRef.current = true
+        if (streamMessage.type === 'READY_ACK' && payload.clientId) {
+          guestReadyIdsRef.current.add(payload.clientId)
+          setGuestList((current) =>
+            current.map((guest) =>
+              guest.id === payload.clientId ? { ...guest, ready: true } : guest,
+            ),
+          )
+          addLog(`Guest ready: ${payload.clientId.slice(0, 6)}`)
           if (pendingPlayRef.current) {
+            maybeStartPendingPlayback()
+          } else if (hostPlaying) {
             const audio = hostAudioRef.current
-            const positionMs = audio ? audio.currentTime * 1000 : 0
-            setTimeout(() => {
-              startPlayback(positionMs)
-            }, 50)
+            const positionMs = audio ? audio.currentTime * 1000 + HOST_PLAY_DELAY_MS : 0
+            void sendPlayToGuest(payload.clientId, positionMs)
           }
         }
       }
@@ -768,7 +1007,7 @@ function App() {
           addLog(`Joined session ${message.sessionCode}`)
         }
 
-        const streamMessage = payload.message as StreamMessage
+        const streamMessage = payload.message as StreamMessage | ReadyRequestMessage
         if (streamMessage.type === 'SYNC_PONG') {
           const t3 = Date.now()
           const offset = ((streamMessage.t1 - streamMessage.t0) + (streamMessage.t2 - t3)) / 2
@@ -776,13 +1015,37 @@ function App() {
           clockOffsetRef.current = offset
           setGuestSyncReady(true)
           guestSyncReadyRef.current = true
-          maybeStartPendingPlayback()
+          addLog('Guest sync ready')
+          void trySendReadyAck()
+          return
+        }
+
+        if (streamMessage.type === 'READY_REQUEST') {
+          guestReadyRequestedRef.current = true
+          guestReadyAcknowledgedRef.current = false
+          guestReadyPositionMsRef.current = streamMessage.positionMs
+          setGuestReadyRequested(true)
+          setGuestReadyAcknowledged(false)
+          guestReadySentRef.current = false
+          guestStreamReadyRef.current = false
+          setGuestStreamReady(false)
+          setGuestSyncReady(false)
+          guestSyncReadyRef.current = false
+          window.hivebeats.sendToHost({ type: 'SYNC_PING', t0: Date.now() })
+          addLog('Host requested readiness')
+          checkGuestReady()
+          void trySendReadyAck()
+          return
         }
 
         if (streamMessage.type === 'STREAM_INIT') {
           resetGuestStream(streamMessage.mimeType, streamMessage.fileName)
+          guestTrackIdRef.current = streamMessage.trackId
           setGuestTrackId(streamMessage.trackId)
           setGuestError(null)
+          if (guestReadyRequestedRef.current) {
+            window.hivebeats.sendToHost({ type: 'SYNC_PING', t0: Date.now() })
+          }
           return
         }
 
@@ -792,6 +1055,7 @@ function App() {
           guestBufferedBytesRef.current += chunkMessage.data.length
           appendNextChunk()
           checkGuestReady()
+          void trySendReadyAck()
           return
         }
 
@@ -804,15 +1068,44 @@ function App() {
           return
         }
 
+        // Handle transport commands with epoch + sequence guards
+        const playCommand = streamMessage as ExtendedPlayCommand
+        const pauseCommand = streamMessage as ExtendedPauseCommand
+        const seekCommand = streamMessage as ExtendedSeekCommand
+
+        const incomingEpoch = playCommand.epoch ?? pauseCommand.epoch ?? seekCommand.epoch
+        if (incomingEpoch !== undefined) {
+          if (incomingEpoch < transportEpochRef.current) {
+            addLog(`Ignoring stale transport (epoch ${incomingEpoch} < ${transportEpochRef.current})`)
+            return
+          }
+          if (incomingEpoch > transportEpochRef.current) {
+            transportEpochRef.current = incomingEpoch
+            clearGuestTransportTimers()
+          }
+        }
+
+        // Sequence number handling: ignore duplicates/stale commands within the same epoch
+        const seq = (playCommand.seq ?? pauseCommand.seq ?? seekCommand.seq) as number | undefined
+        if (seq !== undefined) {
+          if (seq <= guestLastCommandIdRef.current) {
+            addLog(`Ignoring duplicate/stale command (seq ${seq} <= ${guestLastCommandIdRef.current})`)
+            return
+          }
+          guestLastCommandIdRef.current = seq
+        }
+
         const audio = guestAudioRef.current
         if (!audio) return
 
-        if (streamMessage.type === 'CMD_PLAY') {
-          const playCommand = streamMessage as PlayCommandMessage
+        if (playCommand.type === 'CMD_PLAY') {
+          clearGuestTransportTimers()
           const localPlayTime = playCommand.playAt - clockOffsetRef.current
           const delay = Math.max(0, localPlayTime - Date.now())
           audio.currentTime = playCommand.positionMs / 1000
-          setTimeout(() => {
+          const epoch = incomingEpoch ?? transportEpochRef.current
+          guestPlayTimerRef.current = setTimeout(() => {
+            if (transportEpochRef.current !== epoch) return
             audio.play().catch(() => {
               setGuestError('Unable to start playback on guest.')
             })
@@ -820,23 +1113,31 @@ function App() {
           return
         }
 
-        if (streamMessage.type === 'CMD_PAUSE') {
-          const pauseCommand = streamMessage as PauseCommandMessage
+        if (pauseCommand.type === 'CMD_PAUSE') {
+          clearGuestTransportTimers()
           const localPauseTime = pauseCommand.pauseAt - clockOffsetRef.current
           const delay = Math.max(0, localPauseTime - Date.now())
           audio.currentTime = pauseCommand.positionMs / 1000
-          setTimeout(() => {
+          const epoch = incomingEpoch ?? transportEpochRef.current
+          guestPauseTimerRef.current = setTimeout(() => {
+            if (transportEpochRef.current !== epoch) return
             audio.pause()
           }, delay)
+          guestReadyRequestedRef.current = false
+          guestReadyAcknowledgedRef.current = false
+          setGuestReadyRequested(false)
+          setGuestReadyAcknowledged(false)
           return
         }
 
-        if (streamMessage.type === 'CMD_SEEK') {
-          const seekCommand = streamMessage as SeekCommandMessage
+        if (seekCommand.type === 'CMD_SEEK') {
+          clearGuestTransportTimers()
           const localPlayTime = seekCommand.playAt - clockOffsetRef.current
           const delay = Math.max(0, localPlayTime - Date.now())
           audio.currentTime = seekCommand.positionMs / 1000
-          setTimeout(() => {
+          const epoch = incomingEpoch ?? transportEpochRef.current
+          guestSeekTimerRef.current = setTimeout(() => {
+            if (transportEpochRef.current !== epoch) return
             audio.play().catch(() => {
               setGuestError('Unable to resume after seek.')
             })
@@ -853,31 +1154,31 @@ function App() {
     addLog,
     appendNextChunk,
     checkGuestReady,
+    clearGuestTransportTimers,
     deviceAlias,
     deviceId,
+    guestList,
     guestTrackId,
+    hostPlaying,
     maybeStartPendingPlayback,
+    requestGuestReadyAt,
     resetGuestStream,
     scheduleRetry,
-    sessionCode,
     sendHello,
-    startPlayback,
+    selectedTrack,
+    sendPlayToGuest,
+    sessionCode,
+    trySendReadyAck,
   ])
 
   useEffect(() => {
     return () => {
-      if (retryTimerRef.current) {
-        clearTimeout(retryTimerRef.current)
-        retryTimerRef.current = null
-      }
-      if (hostPlayTimerRef.current) {
-        clearTimeout(hostPlayTimerRef.current)
-        hostPlayTimerRef.current = null
-      }
-      if (hostPauseTimerRef.current) {
-        clearTimeout(hostPauseTimerRef.current)
-        hostPauseTimerRef.current = null
-      }
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current)
+      if (hostPlayTimerRef.current) clearTimeout(hostPlayTimerRef.current)
+      if (hostPauseTimerRef.current) clearTimeout(hostPauseTimerRef.current)
+      if (guestPlayTimerRef.current) clearTimeout(guestPlayTimerRef.current)
+      if (guestPauseTimerRef.current) clearTimeout(guestPauseTimerRef.current)
+      if (guestSeekTimerRef.current) clearTimeout(guestSeekTimerRef.current)
     }
   }, [])
 
@@ -886,9 +1187,7 @@ function App() {
       clearTimeout(retryTimerRef.current)
       retryTimerRef.current = null
     }
-    if (!connectionTarget) {
-      setRetryCount(0)
-    }
+    if (!connectionTarget) setRetryCount(0)
   }, [connectionTarget, retryEnabled])
 
   return (
@@ -992,6 +1291,9 @@ function App() {
               <div key={guest.id} className="guest-item">
                 <span>{guest.alias}</span>
                 <span className="guest-meta">{guest.address}</span>
+                <span className={`badge ${guest.ready ? 'badge--udp' : 'badge--mdns'}`}>
+                  {guest.ready ? 'READY' : 'WAITING'}
+                </span>
               </div>
             ))}
           </div>
@@ -1019,6 +1321,9 @@ function App() {
           <div className="transport transport--primary">
             <button type="button" className="btn" onClick={handlePlay} disabled={!selectedTrack}>
               Play
+            </button>
+            <button type="button" className="btn btn--ghost" onClick={requestGuestReady} disabled={!selectedTrack || guestCount === 0}>
+              Request guest ready
             </button>
             <button type="button" className="btn btn--ghost" onClick={handlePause} disabled={!selectedTrack}>
               Pause
@@ -1078,6 +1383,22 @@ function App() {
                 onChange={(event) => setGuestVolume(Number(event.target.value))}
               />
             </div>
+          </div>
+          <div className="meta-row" style={{ marginTop: '1rem' }}>
+            <span>Stream ready: {guestStreamReady ? 'Yes' : 'No'}</span>
+            <span>Sync ready: {guestSyncReady ? 'Yes' : 'No'}</span>
+            <span>Host asked: {guestReadyRequested ? 'Yes' : 'No'}</span>
+            <span>Sent: {guestReadyAcknowledged ? 'Yes' : 'No'}</span>
+          </div>
+          <div className="button-row" style={{ marginTop: '1rem' }}>
+            <button
+              type="button"
+              className="btn"
+              onClick={handleGuestReady}
+              disabled={!guestReadyRequested || guestReadyAcknowledged}
+            >
+              I'm Ready
+            </button>
           </div>
         </section>
       ) : null}
@@ -1169,8 +1490,8 @@ function App() {
         )}
       </section>
 
-      <audio ref={hostAudioRef} className="hidden-audio" />
-      <audio ref={guestAudioRef} className="hidden-audio" />
+      <audio ref={hostAudioRef} className="hidden-audio" preload="auto" />
+      <audio ref={guestAudioRef} className="hidden-audio" preload="auto" />
     </div>
   )
 }

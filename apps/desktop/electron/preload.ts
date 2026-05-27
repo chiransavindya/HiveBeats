@@ -86,6 +86,9 @@ contextBridge.exposeInMainWorld('hivebeats', {
   startStream(filePath: string, fileName: string, mimeType: string, trackId: string) {
     return ipcRenderer.invoke('stream:start', { filePath, fileName, mimeType, trackId })
   },
+  startStreamForGuest(clientId: string, filePath: string, fileName: string, mimeType: string, trackId: string) {
+    return ipcRenderer.invoke('stream:start-for-guest', { clientId, filePath, fileName, mimeType, trackId })
+  },
   stopStream() {
     return ipcRenderer.invoke('stream:stop')
   },

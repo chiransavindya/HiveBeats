@@ -63,6 +63,13 @@ declare global {
           }
       >
       startStream: (filePath: string, fileName: string, mimeType: string, trackId: string) => Promise<{ ok: true }>
+      startStreamForGuest: (
+        clientId: string,
+        filePath: string,
+        fileName: string,
+        mimeType: string,
+        trackId: string,
+      ) => Promise<{ ok: true }>
       stopStream: () => Promise<{ ok: true }>
       startUdpBroadcast: (
         sessionCode: string,

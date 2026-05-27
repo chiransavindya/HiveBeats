@@ -54,6 +54,69 @@ let stopDiscovery: (() => void) | null = null
 let stopUdpListener: (() => void) | null = null
 let activeStream: StreamController | null = null
 let activeStreamTrackId: string | null = null
+const clientStreams = new Map<string, StreamController>()
+
+function stopClientStream(clientId: string) {
+  clientStreams.get(clientId)?.stop()
+  clientStreams.delete(clientId)
+}
+
+function streamTrackToGuest(payload: {
+  clientId: string
+  filePath: string
+  fileName: string
+  mimeType: string
+  trackId: string
+}) {
+  stopClientStream(payload.clientId)
+
+  sendToGuest(
+    payload.clientId,
+    JSON.stringify({
+      type: 'STREAM_INIT',
+      trackId: payload.trackId,
+      fileName: payload.fileName,
+      mimeType: payload.mimeType,
+    }),
+  )
+
+  const stream = startFileStream(payload.filePath, 64 * 1024, {
+    onChunk: (chunk, seq) => {
+      sendToGuest(
+        payload.clientId,
+        JSON.stringify({
+          type: 'STREAM_CHUNK',
+          trackId: payload.trackId,
+          seq,
+          data: chunk.toString('base64'),
+        }),
+      )
+    },
+    onEnd: () => {
+      sendToGuest(
+        payload.clientId,
+        JSON.stringify({
+          type: 'STREAM_END',
+          trackId: payload.trackId,
+        }),
+      )
+      clientStreams.delete(payload.clientId)
+    },
+    onError: (error) => {
+      sendToGuest(
+        payload.clientId,
+        JSON.stringify({
+          type: 'STREAM_END',
+          trackId: payload.trackId,
+          error: error.message,
+        }),
+      )
+      clientStreams.delete(payload.clientId)
+    },
+  })
+
+  clientStreams.set(payload.clientId, stream)
+}
 
 function createWindow() {
   const publicDir = process.env.VITE_PUBLIC ?? RENDERER_DIST
@@ -117,6 +180,7 @@ ipcMain.handle('socket:start-host', (event, payload: { port: number }) => {
       })
     },
     onClientDisconnected: (client) => {
+      stopClientStream(client.id)
       event.sender.send('socket:status', {
         role: 'host',
         status: 'client-disconnected',
@@ -263,9 +327,19 @@ ipcMain.handle('stream:start', (_event, payload: { filePath: string; fileName: s
   return { ok: true }
 })
 
+ipcMain.handle(
+  'stream:start-for-guest',
+  (_event, payload: { clientId: string; filePath: string; fileName: string; mimeType: string; trackId: string }) => {
+    streamTrackToGuest(payload)
+    return { ok: true }
+  },
+)
+
 ipcMain.handle('stream:stop', () => {
   activeStream?.stop()
   activeStream = null
+  clientStreams.forEach((stream) => stream.stop())
+  clientStreams.clear()
   if (activeStreamTrackId) {
     broadcastToGuests(
       JSON.stringify({

@@ -54,6 +54,18 @@ export type SeekCommandMessage = {
   positionMs: number
 }
 
+export type ReadyRequestMessage = {
+  type: 'READY_REQUEST'
+  trackId: string
+  positionMs: number
+}
+
+export type ReadyAckMessage = {
+  type: 'READY_ACK'
+  trackId: string
+  positionMs: number
+}
+
 export type StreamMessage =
   | StreamInitMessage
   | StreamChunkMessage
@@ -64,3 +76,5 @@ export type StreamMessage =
   | PlayCommandMessage
   | PauseCommandMessage
   | SeekCommandMessage
+  | ReadyRequestMessage
+  | ReadyAckMessage

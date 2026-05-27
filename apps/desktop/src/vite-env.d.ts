@@ -31,6 +31,13 @@ interface Window {
 			mimeType: string,
 			trackId: string,
 		) => Promise<{ ok: boolean }>
+		startStreamForGuest: (
+			clientId: string,
+			filePath: string,
+			fileName: string,
+			mimeType: string,
+			trackId: string,
+		) => Promise<{ ok: boolean }>
 		stopStream: () => Promise<{ ok: boolean }>
 		startUdpBroadcast: (
 			sessionCode: string,
