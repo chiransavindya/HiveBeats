@@ -127,6 +127,7 @@ function App() {
   const hostCommandSeqRef = useRef(0)
   const guestLastCommandIdRef = useRef(-1)
   const transportEpochRef = useRef(0)
+  const hostPlayingRef = useRef(false)
 
   const hostPort = Number(hostPortInput) || 7400
   const joinPort = Number(joinPortInput) || hostPort
@@ -233,10 +234,12 @@ function App() {
   }, [])
 
   const startPlayback = useCallback(
-    (positionMs: number, epoch = nextTransportEpoch()) => {
+    (positionMs: number, explicitEpoch?: number) => {
       if (!selectedTrack) return
 
       clearHostTransportTimers()
+
+      const epoch = explicitEpoch ?? nextTransportEpoch()
 
       const seq = hostCommandSeqRef.current++
       const playAt = Date.now() + HOST_PLAY_DELAY_MS
@@ -254,6 +257,7 @@ function App() {
 
       audio.muted = false
       audio.volume = 1
+      audio.currentTime = positionMs / 1000
 
       void window.hivebeats.broadcastToGuests(command)
       hostPlayTimerRef.current = setTimeout(() => {
@@ -264,6 +268,7 @@ function App() {
       }, Math.max(0, playAt - Date.now()))
 
       setHostPlaying(true)
+      hostPlayingRef.current = true
       setPendingPlay(false)
       pendingPlayRef.current = false
     },
@@ -277,6 +282,7 @@ function App() {
       if (transportEpochRef.current !== epoch) return
       audio.pause()
       setHostPlaying(false)
+      hostPlayingRef.current = false
     }, Math.max(0, pauseAt - Date.now()))
   }, [])
 
@@ -299,10 +305,13 @@ function App() {
   }, [areAllGuestsReady, guestList, startPlayback])
 
   const sendPlayToGuest = useCallback(
-    async (clientId: string, positionMs: number) => {
+    async (clientId: string, positionMs: number, explicitEpoch?: number) => {
       if (!selectedTrack) return
 
-      const epoch = nextTransportEpoch()
+      // If an explicit epoch is provided, reuse it without advancing the transport epoch.
+      // This prevents invalidating a host play timer that was already set with the same epoch.
+      // When no explicit epoch is given, we advance to a new epoch as usual.
+      const epoch = explicitEpoch !== undefined ? explicitEpoch : nextTransportEpoch()
       const playAt = Date.now() + HOST_PLAY_DELAY_MS
       const command: ExtendedPlayCommand = {
         type: 'CMD_PLAY',
@@ -571,6 +580,10 @@ function App() {
     const audio = hostAudioRef.current
     if (!audio) return
 
+    // Only start the broadcast stream if it isn't already active for this track.
+    // Starting a new broadcast stream sends STREAM_INIT to all guests, which
+    // resets their MediaSource and readiness state — triggering a spurious
+    // READY_ACK cycle that can invalidate the host's pending play timer.
     if (streamingTrackId !== selectedTrack.id) {
       await window.hivebeats.startStream(
         selectedTrack.filePath,
@@ -610,6 +623,7 @@ function App() {
     pendingPlayRef.current = false
 
     setHostPlaying(false)
+    hostPlayingRef.current = false
 
     const command: ExtendedPauseCommand = {
       type: 'CMD_PAUSE',
@@ -633,6 +647,7 @@ function App() {
     audio.pause()
     audio.currentTime = 0
     setHostPlaying(false)
+    hostPlayingRef.current = false
     setHostPositionMs(0)
     setStreamingTrackId(null)
     setPendingPlay(false)
@@ -791,6 +806,7 @@ function App() {
     const handleLoadedMetadata = () => setHostDurationMs(audio.duration * 1000)
     const handleEnded = () => {
       setHostPlaying(false)
+      hostPlayingRef.current = false
       setHostPositionMs(0)
     }
 
@@ -992,10 +1008,15 @@ function App() {
           addLog(`Guest ready: ${payload.clientId.slice(0, 6)}`)
           if (pendingPlayRef.current) {
             maybeStartPendingPlayback()
-          } else if (hostPlaying) {
+          } else if (hostPlayingRef.current) {
             const audio = hostAudioRef.current
+            // Seek the guest ahead by HOST_PLAY_DELAY_MS to compensate for
+            // the scheduled play delay, so both host and guest are in sync.
             const positionMs = audio ? audio.currentTime * 1000 + HOST_PLAY_DELAY_MS : 0
-            void sendPlayToGuest(payload.clientId, positionMs)
+            // Reuse the current transport epoch (don't advance it) so that any
+            // pending host play timer — which was set with the same epoch — is
+            // NOT invalidated by a new epoch from sendPlayToGuest.
+            void sendPlayToGuest(payload.clientId, positionMs, transportEpochRef.current)
           }
         }
       }
@@ -1159,7 +1180,6 @@ function App() {
     deviceId,
     guestList,
     guestTrackId,
-    hostPlaying,
     maybeStartPendingPlayback,
     requestGuestReadyAt,
     resetGuestStream,

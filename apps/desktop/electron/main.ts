@@ -285,6 +285,12 @@ ipcMain.handle('stream:start', (_event, payload: { filePath: string; fileName: s
   activeStream?.stop()
   activeStreamTrackId = payload.trackId
 
+  // Stop any per-guest streams before starting the broadcast stream.
+  // Both streams write to the same WebSocket connection for each guest;
+  // running them concurrently interleaves chunks and corrupts the MediaSource buffer.
+  clientStreams.forEach((stream) => stream.stop())
+  clientStreams.clear()
+
   broadcastToGuests(
     JSON.stringify({
       type: 'STREAM_INIT',
