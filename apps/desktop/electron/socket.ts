@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import type { IncomingMessage } from 'node:http'
+import { createServer, type IncomingMessage } from 'node:http'
+import { createWriteStream } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import WebSocket, { WebSocketServer, type RawData } from 'ws'
 
 type HostClient = {
@@ -23,6 +26,7 @@ type GuestHandlers = {
 }
 
 let server: WebSocketServer | null = null
+let httpServer: ReturnType<typeof createServer> | null = null
 const clients = new Map<string, HostClient>()
 
 let guestSocket: WebSocket | null = null
@@ -30,7 +34,45 @@ let guestSocket: WebSocket | null = null
 export function startHost(port: number, handlers: HostHandlers) {
   stopHost()
 
-  server = new WebSocketServer({ port })
+  httpServer = createServer((req, res) => {
+    // Handle CORS
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('Access-Control-Allow-Methods', 'OPTIONS, POST')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Filename')
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(200)
+      res.end()
+      return
+    }
+
+    if (req.method === 'POST' && req.url === '/upload') {
+      const filename = req.headers['x-filename'] || 'upload.audio'
+      // Ensure safe filename by replacing non-alphanumeric chars (excluding dot/dash)
+      const safeFilename = (filename as string).replace(/[^a-zA-Z0-9.-]/g, '_')
+      const filepath = join(tmpdir(), `hivebeats-${Date.now()}-${safeFilename}`)
+      
+      const stream = createWriteStream(filepath)
+      req.pipe(stream)
+      
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ path: filepath }))
+      })
+      
+      req.on('error', (err) => {
+        console.error('Upload stream error:', err)
+        res.writeHead(500)
+        res.end()
+      })
+      return
+    }
+
+    res.writeHead(404)
+    res.end()
+  })
+
+  server = new WebSocketServer({ server: httpServer })
 
   server.on('connection', (socket: WebSocket, request: IncomingMessage) => {
     const address = request.socket.remoteAddress ?? 'unknown'
@@ -60,6 +102,8 @@ export function startHost(port: number, handlers: HostHandlers) {
   server.on('error', (error: Error) => {
     handlers.onHostError?.(error as Error)
   })
+
+  httpServer.listen(port)
 }
 
 export function stopHost() {
@@ -67,6 +111,8 @@ export function stopHost() {
   clients.clear()
   server?.close()
   server = null
+  httpServer?.close()
+  httpServer = null
 }
 
 export function broadcastToGuests(message: string) {

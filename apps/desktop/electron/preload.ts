@@ -70,6 +70,9 @@ contextBridge.exposeInMainWorld('hivebeats', {
   broadcastToGuests(message: unknown) {
     return ipcRenderer.invoke('socket:broadcast', { message: JSON.stringify(message) })
   },
+  uploadFileToHost(filePath: string, host: string, port: number, filename: string) {
+    return ipcRenderer.invoke('socket:upload-file', { filePath, host, port, filename })
+  },
   onSocketStatus(callback: (status: unknown) => void) {
     const handler = (_event: Electron.IpcRendererEvent, status: unknown) => callback(status)
     ipcRenderer.on('socket:status', handler)

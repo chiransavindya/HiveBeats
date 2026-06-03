@@ -47,6 +47,7 @@ declare global {
       sendToHost: (message: unknown) => Promise<{ ok: boolean }>
       sendToGuest: (clientId: string, message: unknown) => Promise<{ ok: boolean }>
       broadcastToGuests: (message: unknown) => Promise<{ ok: true }>
+      uploadFileToHost: (filePath: string, host: string, port: number, filename: string) => Promise<{ ok: boolean; path?: string }>
       onSocketStatus: (
         callback: (status: SocketStatusPayload) => void,
       ) => () => void

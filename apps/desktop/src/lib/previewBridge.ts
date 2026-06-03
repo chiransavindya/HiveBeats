@@ -18,6 +18,7 @@ export function ensurePreviewBridge() {
     sendToHost: ok,
     sendToGuest: ok,
     broadcastToGuests: ok,
+    uploadFileToHost: ok as any,
     onSocketStatus: () => off,
     onSocketMessage: () => off,
     pickAudioFile: async () => ({ canceled: true }),

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, protocol } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, protocol, nativeTheme } from 'electron'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import type { Service } from 'bonjour-service'
@@ -123,10 +123,21 @@ function createWindow() {
 
   win = new BrowserWindow({
     icon: path.join(publicDir, 'electron-vite.svg'),
+    autoHideMenuBar: true,
+    title: 'HiveBeats',
     webPreferences: {
       preload: path.join(__dirname, 'preload.mjs'),
     },
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: '#0a0a0a',
+      symbolColor: '#ffffff',
+      height: 58,
+    },
   })
+  
+  win.setMenuBarVisibility(false)
+  nativeTheme.themeSource = 'dark'
 
   // Test active push message to Renderer-process.
   win.webContents.on('did-finish-load', () => {
@@ -139,6 +150,8 @@ function createWindow() {
     // win.loadFile('dist/index.html')
     win.loadFile(path.join(RENDERER_DIST, 'index.html'))
   }
+  
+  win.maximize()
 }
 
 ipcMain.handle('mdns:advertise', (_event, payload: { sessionCode: string; port: number }) => {
