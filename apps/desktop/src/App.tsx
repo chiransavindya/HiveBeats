@@ -70,7 +70,7 @@ type QueueSocketMsg =
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const SYNC_INTERVAL_MS = 5000
-const HOST_PLAY_DELAY_MS = 1200
+const HOST_PLAY_DELAY_MS = 2000
 const HOST_PAUSE_DELAY_MS = 80
 const GUEST_READY_BUFFER_SECONDS = 2.5
 const GUEST_READY_POSITION_TOLERANCE_SECONDS = 0.15
@@ -176,8 +176,8 @@ function App() {
   const [guestMuted, setGuestMuted] = useState(false)
   const [guestStreamReady, setGuestStreamReady] = useState(false)
   const [guestSyncReady, setGuestSyncReady] = useState(false)
-  const [guestReadyRequested, setGuestReadyRequested] = useState(false)
-  const [guestReadyAcknowledged, setGuestReadyAcknowledged] = useState(false)
+  const [_guestReadyRequested, setGuestReadyRequested] = useState(false)
+  const [_guestReadyAcknowledged, setGuestReadyAcknowledged] = useState(false)
   const [clockOffsetMs, setClockOffsetMs] = useState(0)
 
   // ── Queue & playlists ──────────────────────────────────────────────────────
@@ -194,7 +194,7 @@ function App() {
   const [guestPendingRequest, setGuestPendingRequest] = useState<{ id: string; suggestion: string } | null>(null)
 
   // ── Connection & retry ─────────────────────────────────────────────────────
-  const [pendingPlay, setPendingPlay] = useState(false)
+  const [_pendingPlay, setPendingPlay] = useState(false)
   const [hostPortInput, setHostPortInput] = useState('7400')
   const [joinPortInput, setJoinPortInput] = useState('7400')
   const [broadcastPortInput, setBroadcastPortInput] = useState('7401')
@@ -239,6 +239,8 @@ function App() {
   const hostCommandSeqRef = useRef(0)
   const guestLastCommandIdRef = useRef(-1)
   const transportEpochRef = useRef(0)
+  // Stash a CMD_PLAY received before clock sync is ready; applied once SYNC_PONG arrives.
+  const pendingCmdPlayRef = useRef<{ command: ExtendedPlayCommand; incomingEpoch: number | undefined } | null>(null)
   const hostPlayingRef = useRef(false)
   const isScrubbing = useRef(false)
 
@@ -262,6 +264,8 @@ function App() {
       document.documentElement.setAttribute('data-theme', theme)
     }
     localStorage.setItem('hivebeats-theme', theme)
+    // Update native window controls for Electron
+    ;(window as any).hivebeats?.setTheme?.(theme)
   }, [theme])
   const maxRetries = 3
   const isHost = hostRunning
@@ -661,6 +665,7 @@ function App() {
     if (guestPlayTimerRef.current) { clearTimeout(guestPlayTimerRef.current); guestPlayTimerRef.current = null }
     if (guestPauseTimerRef.current) { clearTimeout(guestPauseTimerRef.current); guestPauseTimerRef.current = null }
     if (guestSeekTimerRef.current) { clearTimeout(guestSeekTimerRef.current); guestSeekTimerRef.current = null }
+    pendingCmdPlayRef.current = null  // also discard any buffered-but-not-yet-scheduled CMD_PLAY
   }, [])
 
   const startPlayback = useCallback((positionMs: number, explicitEpoch?: number) => {
@@ -813,11 +818,6 @@ function App() {
     })
   }, [appendNextChunk, checkGuestReady, clearGuestTransportTimers, trySendReadyAck])
 
-  const handleGuestReady = async () => {
-    if (!guestSyncReadyRef.current) await window.hivebeats.sendToHost({ type: 'SYNC_PING', t0: Date.now() })
-    checkGuestReady()
-    await trySendReadyAck()
-  }
 
   // ─── Discovery helpers ─────────────────────────────────────────────────────
 
@@ -1338,6 +1338,23 @@ function App() {
           setClockOffsetMs(offset); clockOffsetRef.current = offset
           setGuestSyncReady(true); guestSyncReadyRef.current = true
           addLog('Guest sync ready')
+          // Apply any CMD_PLAY that arrived before this sync completed, now that we have a fresh offset.
+          if (pendingCmdPlayRef.current) {
+            const { command: pendingCmd, incomingEpoch: pendingEpoch } = pendingCmdPlayRef.current
+            pendingCmdPlayRef.current = null
+            const audio = guestAudioRef.current
+            if (audio) {
+              clearGuestTransportTimers()
+              const delay = Math.max(0, pendingCmd.playAt - offset - Date.now())
+              audio.currentTime = pendingCmd.positionMs / 1000
+              const epoch = pendingEpoch ?? transportEpochRef.current
+              guestPlayTimerRef.current = setTimeout(() => {
+                if (transportEpochRef.current !== epoch) return
+                audio.play().catch(() => setGuestError('Unable to start playback on guest.'))
+              }, delay)
+              addLog(`Applied buffered CMD_PLAY after sync (delay ${delay}ms)`)
+            }
+          }
           void trySendReadyAck(); return
         }
         if (streamMessage.type === 'READY_REQUEST') {
@@ -1355,7 +1372,10 @@ function App() {
           guestTrackIdRef.current = streamMessage.trackId as string
           setGuestTrackId(streamMessage.trackId as string)
           setGuestError(null)
-          if (guestReadyRequestedRef.current) window.hivebeats.sendToHost({ type: 'SYNC_PING', t0: Date.now() })
+          // Always refresh the clock offset after a stream reset, regardless of ready-request state.
+          // This ensures CMD_PLAY is processed with a fresh offset rather than a potentially stale one.
+          pendingCmdPlayRef.current = null
+          window.hivebeats.sendToHost({ type: 'SYNC_PING', t0: Date.now() })
           return
         }
         if (streamMessage.type === 'STREAM_CHUNK') {
@@ -1389,6 +1409,14 @@ function App() {
 
         if (playCmd.type === 'CMD_PLAY') {
           clearGuestTransportTimers()
+          // If clock sync hasn't been established yet, buffer this command and apply
+          // it once SYNC_PONG arrives with a fresh offset. This prevents playing
+          // earlier than the host due to an uncalibrated clock offset.
+          if (!guestSyncReadyRef.current) {
+            pendingCmdPlayRef.current = { command: playCmd, incomingEpoch }
+            addLog('CMD_PLAY buffered: awaiting clock sync')
+            return
+          }
           const delay = Math.max(0, playCmd.playAt - clockOffsetRef.current - Date.now())
           audio.currentTime = playCmd.positionMs / 1000
           const epoch = incomingEpoch ?? transportEpochRef.current
@@ -1642,10 +1670,6 @@ function App() {
 
           {/* Actions */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            {pendingPlay && <span style={{ fontSize: '0.78rem', color: 'var(--warn)' }}>⏳ Waiting for guests…</span>}
-            <button className="btn btn--ghost" onClick={requestGuestReady} disabled={!selectedTrack || guestCount === 0} style={{ padding: '8px 16px', fontSize: '0.8rem' }}>
-              Sync Guests
-            </button>
             <button className="btn btn--danger" onClick={handleStop} disabled={!selectedTrack} style={{ padding: '8px 16px', fontSize: '0.8rem' }}>
               <IconStop /> Stop
             </button>
@@ -1656,7 +1680,18 @@ function App() {
       {/* Guest list */}
       {guestList.length > 0 && (
         <div className="panel">
-          <p className="panel-title">Connected Guests</p>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+            <p className="panel-title" style={{ margin: 0 }}>Connected Guests</p>
+            <button
+              className="btn btn--ghost"
+              onClick={requestGuestReady}
+              disabled={!selectedTrack || guestCount === 0}
+              style={{ padding: '5px 12px', fontSize: '0.75rem' }}
+              title="Ask all guests to re-buffer and re-sync clocks. Use if a guest stays on WAITING after you pick a track."
+            >
+              ↺ Re-sync
+            </button>
+          </div>
           <div className="guest-list">
             {guestList.map((guest) => (
               <div key={guest.id} className="guest-item">
@@ -1752,14 +1787,7 @@ function App() {
           </div>
         </div>
 
-        {/* Ready button — only show when needed */}
-        {guestReadyRequested && !guestReadyAcknowledged && (
-          <div className="alert alert--info">
-            Host is requesting readiness…
-            <button className="btn btn--primary" style={{ marginLeft: 'auto', padding: '6px 14px' }}
-              onClick={handleGuestReady}>I'm Ready</button>
-          </div>
-        )}
+
         {guestError ? <div className="alert alert--error" role="alert">⚠ {guestError}</div> : null}
       </div>
 
@@ -2118,7 +2146,7 @@ function App() {
 
     {/* ── Banner ── */}
     <div className="landing-banner">
-      <div className="landing-banner-title">Made by Bees of the Hive 🐝</div>
+      <div className="landing-banner-title">Made by Bees of the Hive</div>
       <div className="landing-banner-quote">"The hive mind is in the music. Listen together."</div>
     </div>
   </>

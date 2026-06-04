@@ -24,6 +24,9 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
 })
 
 contextBridge.exposeInMainWorld('hivebeats', {
+  setTheme(theme: 'system' | 'light' | 'dark') {
+    return ipcRenderer.invoke('theme:set', theme)
+  },
   startDiscovery() {
     return ipcRenderer.invoke('mdns:start-discovery')
   },

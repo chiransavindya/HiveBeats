@@ -130,14 +130,23 @@ function createWindow() {
     },
     titleBarStyle: 'hidden',
     titleBarOverlay: {
-      color: '#0a0a0a',
-      symbolColor: '#ffffff',
+      color: nativeTheme.shouldUseDarkColors ? '#0a0a0a' : '#ffffff',
+      symbolColor: nativeTheme.shouldUseDarkColors ? '#ffffff' : '#000000',
       height: 58,
     },
   })
   
   win.setMenuBarVisibility(false)
-  nativeTheme.themeSource = 'dark'
+
+  // Update titleBarOverlay when theme changes
+  nativeTheme.on('updated', () => {
+    if (win) {
+      win.setTitleBarOverlay({
+        color: nativeTheme.shouldUseDarkColors ? '#0a0a0a' : '#ffffff',
+        symbolColor: nativeTheme.shouldUseDarkColors ? '#ffffff' : '#000000',
+      })
+    }
+  })
 
   // Test active push message to Renderer-process.
   win.webContents.on('did-finish-load', () => {
@@ -153,6 +162,10 @@ function createWindow() {
   
   win.maximize()
 }
+
+ipcMain.handle('theme:set', (_event, theme: 'system' | 'light' | 'dark') => {
+  nativeTheme.themeSource = theme
+})
 
 ipcMain.handle('mdns:advertise', (_event, payload: { sessionCode: string; port: number }) => {
   advertisedService?.stop?.()
