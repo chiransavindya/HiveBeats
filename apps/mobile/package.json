@@ -15,6 +15,7 @@
     "@react-native-community/slider": "5.1.2",
     "@supabase/supabase-js": "^2.106.0",
     "expo": "~55.0.25",
+    "expo-audio": "~55.0.14",
     "expo-av": "^16.0.8",
     "expo-barcode-scanner": "^13.0.1",
     "expo-clipboard": "~55.0.13",
