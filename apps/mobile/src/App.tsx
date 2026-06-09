@@ -1,10 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useMemo } from 'react'
 import {
   Appearance,
-  SafeAreaView,
   StyleSheet,
   View,
+  Platform,
+  StatusBar,
 } from 'react-native'
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context'
 import NetInfo from '@react-native-community/netinfo'
 import { StatusBar as ExpoStatusBar } from 'expo-status-bar'
 import { useKeepAwake } from 'expo-keep-awake'
@@ -26,8 +28,18 @@ import { audioService } from './services/audioService'
 import { udpDiscovery } from './services/udpDiscovery'
 import { socketClient } from './services/socketClient'
 import { loadTheme, loadNetworkSettings } from './lib/asyncStorage'
+import { useAppTheme } from './hooks/useAppTheme'
+import type { AppThemeColors } from './theme/theme'
 
 export default function App() {
+  return (
+    <SafeAreaProvider>
+      <MainApp />
+    </SafeAreaProvider>
+  )
+}
+
+function MainApp() {
   const {
     hostRunning,
     guestConnected,
@@ -53,6 +65,9 @@ export default function App() {
     guestConnected: isGuestConnected,
   } = useSessionStore()
 
+  const themeColors = useAppTheme()
+  const styles = useMemo(() => createStyles(themeColors), [themeColors])
+
   const [activeTab, setActiveTab] = useState<TabId>('player')
 
   // Keep screen awake during live sessions
@@ -65,6 +80,8 @@ export default function App() {
 
       const savedTheme = await loadTheme()
       setTheme(savedTheme)
+      const schemeToApply = savedTheme === 'system' ? Appearance.getColorScheme() ?? 'dark' : savedTheme
+      Appearance.setColorScheme(schemeToApply)
 
       const ns = await loadNetworkSettings()
       setHostPortInput(ns.hostPort)
@@ -256,14 +273,14 @@ export default function App() {
   }
 
   return (
-    <SafeAreaView style={styles.root}>
-      <ExpoStatusBar style="light" />
+    <SafeAreaView style={styles.root} edges={['top', 'left', 'right']}>
+      <ExpoStatusBar style={themeColors.blurTint === 'light' ? 'dark' : 'light'} backgroundColor="transparent" translucent />
 
       <View style={styles.screenArea}>
         {renderScreen()}
       </View>
 
-      <PlayerMiniBar />
+      {activeTab !== 'player' && <PlayerMiniBar />}
 
       <BottomTabBar
         activeTab={activeTab}
@@ -276,10 +293,10 @@ export default function App() {
   )
 }
 
-const styles = StyleSheet.create({
+const createStyles = (theme: AppThemeColors) => StyleSheet.create({
   root: {
     flex: 1,
-    backgroundColor: '#06111f',
+    backgroundColor: theme.background,
   },
   screenArea: {
     flex: 1,
