@@ -1,9 +1,16 @@
 /**
- * Socket client stub for the Guest device (v1.1 Mobile).
+ * socketClient.ts — Real WebSocket-based guest client.
  *
- * In the full native build this would use react-native-tcp-socket.
- * For the current Expo managed workflow, this provides a realistic
- * simulation so all UI/UX guest flows work correctly.
+ * The desktop host runs an HTTP + WebSocket server (using the `ws` npm package)
+ * on the host port (default 7400).  React Native ships a native WebSocket
+ * implementation that works in Expo Go without any extra native modules, so we
+ * can connect directly — no react-native-tcp-socket needed.
+ *
+ * Protocol (mirrors desktop socket.ts / App.tsx):
+ *   → HELLO   { type:'HELLO', deviceAlias, deviceId }
+ *   ← WELCOME { type:'WELCOME', hostId }
+ *   ← CMD_PLAY / CMD_PAUSE / CMD_SEEK / SYNC_PONG / STREAM_* …
+ *   → SYNC_PING / QUEUE_REQUEST / READY_ACK …
  */
 
 export type ClientEventMap = {
@@ -18,10 +25,12 @@ type EventListeners = {
 }
 
 class SocketClient {
-  private connected = false
+  private ws: WebSocket | null = null
+  private _connected = false
   private host = ''
   private port = 7400
   private deviceAlias = ''
+  private deviceId = ''
   private listeners: EventListeners = {
     connected: [],
     disconnected: [],
@@ -31,46 +40,103 @@ class SocketClient {
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-  async connect(host: string, port: number, deviceAlias: string): Promise<void> {
+  async connect(host: string, port: number, deviceAlias: string, deviceId = ''): Promise<void> {
+    // Tear down any existing connection first
+    this.disconnect()
+
     this.host = host
     this.port = port
     this.deviceAlias = deviceAlias
+    this.deviceId = deviceId || deviceAlias
 
-    // In native: TcpSocket.createConnection({ host, port }, () => { ... })
-    // For stub: simulate successful connection after a short delay
-    await new Promise<void>((resolve) => setTimeout(resolve, 500))
+    return new Promise<void>((resolve, reject) => {
+      const url = `ws://${host}:${port}`
+      console.log(`[SocketClient] Connecting to ${url}`)
 
-    this.connected = true
-    this.emit('connected')
+      // React Native's WebSocket is a global — no import needed
+      const ws = new WebSocket(url)
+      this.ws = ws
 
-    // Send initial HELLO message
-    await this.sendToHost({
-      type: 'HELLO',
-      deviceAlias,
-      deviceId: this.deviceAlias,
+      const timeout = setTimeout(() => {
+        ws.close()
+        reject(new Error(`Connection timed out to ${url}`))
+      }, 8000)
+
+      ws.onopen = () => {
+        clearTimeout(timeout)
+        this._connected = true
+        this.emit('connected')
+
+        // Send HELLO immediately after connect (mirrors desktop guest logic)
+        this.sendToHost({
+          type: 'HELLO',
+          deviceAlias: this.deviceAlias,
+          deviceId: this.deviceId,
+        })
+
+        console.log(`[SocketClient] Connected to ${url}`)
+        resolve()
+      }
+
+      ws.onmessage = (event) => {
+        try {
+          const data = typeof event.data === 'string'
+            ? JSON.parse(event.data)
+            : event.data
+          this.emit('message', data as Record<string, unknown>)
+        } catch {
+          // ignore malformed messages
+        }
+      }
+
+      ws.onclose = () => {
+        clearTimeout(timeout)
+        const wasConnected = this._connected
+        this._connected = false
+        this.ws = null
+        if (wasConnected) {
+          this.emit('disconnected')
+        }
+        console.log('[SocketClient] Connection closed')
+      }
+
+      ws.onerror = (event) => {
+        clearTimeout(timeout)
+        const err = new Error(`WebSocket error connecting to ${url}`)
+        console.warn('[SocketClient] Error:', err.message)
+        if (!this._connected) {
+          reject(err)
+        } else {
+          this.emit('error', err)
+        }
+      }
     })
-
-    console.log(`[SocketClient] Connected to ${host}:${port} as ${deviceAlias}`)
   }
 
-  async disconnect(): Promise<void> {
-    if (!this.connected) return
-    this.connected = false
-    this.emit('disconnected')
+  disconnect(): void {
+    if (this.ws) {
+      this.ws.onclose = null // prevent double-emit
+      this.ws.onerror = null
+      try { this.ws.close() } catch { /* ignore */ }
+      this.ws = null
+    }
+    if (this._connected) {
+      this._connected = false
+      this.emit('disconnected')
+    }
     console.log('[SocketClient] Disconnected')
   }
 
   // ── Messaging ─────────────────────────────────────────────────────────────
 
-  async sendToHost(message: Record<string, unknown>): Promise<void> {
-    if (!this.connected) return
-    // In native: socket.write(JSON.stringify(message) + '\n')
-    console.log('[SocketClient] → host:', message.type)
-  }
-
-  /** Called by native layer when a message arrives from host */
-  notifyMessage(message: Record<string, unknown>): void {
-    this.emit('message', message)
+  sendToHost(message: Record<string, unknown>): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
+    try {
+      this.ws.send(JSON.stringify(message))
+      console.log('[SocketClient] → host:', message.type)
+    } catch (err) {
+      console.warn('[SocketClient] send failed:', err)
+    }
   }
 
   // ── Event emitter ─────────────────────────────────────────────────────────
@@ -84,6 +150,10 @@ class SocketClient {
       (this.listeners[event] as Array<ClientEventMap[K]>).filter((l) => l !== listener)
   }
 
+  removeAllListeners(): void {
+    this.listeners = { connected: [], disconnected: [], message: [], error: [] }
+  }
+
   private emit<K extends keyof ClientEventMap>(event: K, ...args: Parameters<ClientEventMap[K]>): void {
     for (const listener of this.listeners[event]) {
       // @ts-expect-error spread args
@@ -94,16 +164,11 @@ class SocketClient {
   // ── Queries ───────────────────────────────────────────────────────────────
 
   isConnected(): boolean {
-    return this.connected
+    return this._connected && this.ws?.readyState === WebSocket.OPEN
   }
 
-  getHost(): string {
-    return this.host
-  }
-
-  getPort(): number {
-    return this.port
-  }
+  getHost(): string { return this.host }
+  getPort(): number { return this.port }
 }
 
 export const socketClient = new SocketClient()

@@ -289,10 +289,10 @@ export const useSessionStore = create<SessionStore>((set, get) => {
     },
 
     joinSession: async (code, hostIp) => {
-      const { joinPortInput, deviceAlias } = get()
+      const { joinPortInput, deviceAlias, deviceId } = get()
       const port = Number(joinPortInput) || HOST_PORT
       try {
-        await socketClient.connect(hostIp, port, deviceAlias)
+        await socketClient.connect(hostIp, port, deviceAlias, deviceId)
         set({
           sessionCode: code,
           role: 'guest',
@@ -302,12 +302,12 @@ export const useSessionStore = create<SessionStore>((set, get) => {
         })
         pushLog(`Joined session ${code} at ${hostIp}:${port}`)
       } catch (err) {
-        set({ guestError: `Failed to join: ${err}` })
+        set({ guestError: `Failed to join: ${String(err)}` })
       }
     },
 
     leaveSession: async () => {
-      await socketClient.disconnect()
+      socketClient.disconnect()
       await audioService.stop()
       clockSync.reset()
       set({

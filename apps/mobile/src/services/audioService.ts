@@ -1,4 +1,25 @@
-import { Audio } from 'expo-av'
+/**
+ * AudioService — wraps expo-audio (SDK 53+ replacement for expo-av).
+ *
+ * expo-audio uses the 'ExpoAudio' native module (registered in Expo Go SDK 55)
+ * instead of the legacy 'ExponentAV' native module (expo-av) which is no longer
+ * reliably available in the current Expo Go build.
+ *
+ * Key differences from expo-av:
+ *   - All time values are in SECONDS (not milliseconds)
+ *   - Imperative API via createAudioPlayer / player.addListener
+ *   - setAudioModeAsync → setAudioModeAsync from 'expo-audio' (different shape)
+ */
+
+import {
+  createAudioPlayer,
+  setAudioModeAsync,
+  type AudioPlayer,
+  type AudioStatus,
+} from 'expo-audio'
+
+// ── Public callback type ─────────────────────────────────────────────────────
+// We keep the public interface in milliseconds so callers don't need to change.
 
 export type AudioStatusCallback = (status: {
   isLoaded: boolean
@@ -9,19 +30,25 @@ export type AudioStatusCallback = (status: {
 }) => void
 
 class AudioService {
-  private sound: Audio.Sound | null = null
+  private player: AudioPlayer | null = null
   private statusCallback: AudioStatusCallback | null = null
+  private configured = false
+  private lastStatus: AudioStatus | null = null
 
-  // ── Configure audio session ───────────────────────────────────────────────
+  // ── Configure audio session (call once on app start) ──────────────────────
 
   async configure(): Promise<void> {
-    await Audio.setAudioModeAsync({
-      allowsRecordingIOS: false,
-      staysActiveInBackground: true,
-      playsInSilentModeIOS: true,
-      shouldDuckAndroid: true,
-      playThroughEarpieceAndroid: false,
-    })
+    if (this.configured) return
+    try {
+      await setAudioModeAsync({
+        playsInSilentMode: true,
+        shouldPlayInBackground: true,
+        interruptionMode: 'mixWithOthers',
+      })
+      this.configured = true
+    } catch (err) {
+      console.warn('[AudioService] configure failed:', err)
+    }
   }
 
   // ── Status listener ───────────────────────────────────────────────────────
@@ -30,93 +57,105 @@ class AudioService {
     this.statusCallback = callback
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private handleStatus = (status: any) => {
+  private handleStatus = (status: AudioStatus) => {
     if (!this.statusCallback) return
-    if (status.isLoaded) {
-      this.statusCallback({
-        isLoaded: true,
-        isPlaying: status.isPlaying,
-        positionMs: status.positionMillis,
-        durationMs: status.durationMillis ?? 0,
-        didJustFinish: status.didJustFinish,
-      })
-    } else {
-      this.statusCallback({
-        isLoaded: false,
-        isPlaying: false,
-        positionMs: 0,
-        durationMs: 0,
-        didJustFinish: false,
-      })
-    }
+    const prevFinished = this.lastStatus?.didJustFinish ?? false
+    this.lastStatus = status
+
+    this.statusCallback({
+      isLoaded: status.isLoaded,
+      isPlaying: status.playing,
+      positionMs: Math.round((status.currentTime ?? 0) * 1000),
+      durationMs: Math.round((status.duration ?? 0) * 1000),
+      didJustFinish: !prevFinished && (status.didJustFinish ?? false),
+    })
   }
 
   // ── Load track ────────────────────────────────────────────────────────────
 
   async load(uri: string, shouldPlay: boolean, volume: number): Promise<{ durationMs: number }> {
+    // Destroy old player before creating new one
     await this.unload()
 
-    const { sound, status } = await Audio.Sound.createAsync(
+    this.player = createAudioPlayer(
       { uri },
-      {
-        shouldPlay,
-        volume,
-        progressUpdateIntervalMillis: 300,
-      },
+      { updateInterval: 0.3 }, // 300 ms status updates
     )
 
-    sound.setOnPlaybackStatusUpdate(this.handleStatus)
-    this.sound = sound
+    // Set initial volume
+    this.player.volume = volume
 
-    const durationMs = status.isLoaded ? (status.durationMillis ?? 0) : 0
+    // Subscribe to status updates
+    this.player.addListener('playbackStatusUpdate', this.handleStatus)
+
+    if (shouldPlay) {
+      this.player.play()
+    }
+
+    // Give the player a moment to load duration
+    await new Promise<void>((resolve) => setTimeout(resolve, 200))
+
+    const durationMs = Math.round((this.player.duration ?? 0) * 1000)
     return { durationMs }
   }
 
   // ── Transport ─────────────────────────────────────────────────────────────
 
   async play(): Promise<void> {
-    await this.sound?.playAsync()
+    this.player?.play()
   }
 
   async pause(): Promise<void> {
-    await this.sound?.pauseAsync()
+    this.player?.pause()
   }
 
   async stop(): Promise<void> {
-    await this.sound?.stopAsync()
+    this.player?.pause()
+    if (this.player) {
+      await this.player.seekTo(0)
+    }
   }
 
   async seek(positionMs: number): Promise<void> {
-    await this.sound?.setPositionAsync(positionMs)
+    if (this.player) {
+      await this.player.seekTo(positionMs / 1000)
+    }
   }
 
   // ── Volume ────────────────────────────────────────────────────────────────
 
   async setVolume(volume: number): Promise<void> {
-    await this.sound?.setVolumeAsync(Math.max(0, Math.min(1, volume)))
+    if (this.player) {
+      this.player.volume = Math.max(0, Math.min(1, volume))
+    }
   }
 
   async setMuted(muted: boolean): Promise<void> {
-    await this.sound?.setIsMutedAsync(muted)
+    if (this.player) {
+      this.player.muted = muted
+    }
   }
 
   // ── Playback rate ─────────────────────────────────────────────────────────
 
   async setRate(rate: number): Promise<void> {
-    await this.sound?.setRateAsync(rate, true)
+    if (this.player) {
+      this.player.playbackRate = rate
+    }
   }
 
   // ── Unload ────────────────────────────────────────────────────────────────
 
   async unload(): Promise<void> {
-    const s = this.sound
-    this.sound = null
-    if (s) {
+    const p = this.player
+    this.player = null
+    this.lastStatus = null
+    if (p) {
       try {
-        await s.unloadAsync()
+        p.pause()
+        p.remove()
       } catch {
-        // ignore
+        // ignore cleanup errors
       }
     }
   }
@@ -124,9 +163,18 @@ class AudioService {
   // ── Query ─────────────────────────────────────────────────────────────────
 
   isLoaded(): boolean {
-    return this.sound !== null
+    return this.player !== null
+  }
+
+  getCurrentPositionMs(): number {
+    return Math.round((this.player?.currentTime ?? 0) * 1000)
+  }
+
+  getDurationMs(): number {
+    return Math.round((this.player?.duration ?? 0) * 1000)
   }
 }
 
-// Singleton instance
+// Singleton — expo-audio doesn't call requireNativeModule at import time.
+// AudioPlayer instances are created lazily via createAudioPlayer().
 export const audioService = new AudioService()
