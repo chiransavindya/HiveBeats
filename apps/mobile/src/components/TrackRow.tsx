@@ -1,5 +1,8 @@
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native'
+import { useMemo } from 'react'
 import type { Track } from '../types/session'
+import { useAppTheme } from '../hooks/useAppTheme'
+import type { AppThemeColors } from '../theme/theme'
 import { formatTime } from '../lib/formatters'
 
 type Props = {
@@ -11,6 +14,9 @@ type Props = {
 }
 
 export default function TrackRow({ track, index, active, onPress, onRemove }: Props) {
+  const themeColors = useAppTheme()
+  const styles = useMemo(() => createStyles(themeColors), [themeColors])
+
   return (
     <TouchableOpacity
       style={[styles.row, active && styles.rowActive]}
@@ -53,42 +59,42 @@ export default function TrackRow({ track, index, active, onPress, onRemove }: Pr
   )
 }
 
-const styles = StyleSheet.create({
+const createStyles = (theme: AppThemeColors) => StyleSheet.create({
   row: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
     borderRadius: 16,
-    backgroundColor: 'rgba(255, 255, 255, 0.04)',
+    backgroundColor: theme.card,
     padding: 12,
   },
   rowActive: {
-    backgroundColor: 'rgba(255, 107, 53, 0.12)',
+    backgroundColor: theme.primaryDim,
     borderWidth: 1,
-    borderColor: 'rgba(255, 107, 53, 0.3)',
+    borderColor: theme.primaryDim,
   },
   indexBadge: {
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    backgroundColor: theme.cardBorder,
     alignItems: 'center',
     justifyContent: 'center',
     flexShrink: 0,
   },
   indexBadgeActive: {
-    backgroundColor: 'rgba(255, 107, 53, 0.25)',
+    backgroundColor: theme.primaryDim,
   },
   indexText: {
-    color: 'rgba(225, 235, 247, 0.7)',
+    color: theme.textSecondary,
     fontSize: 12,
     fontWeight: '700',
   },
   indexTextActive: {
-    color: '#ff8c5a',
+    color: theme.primary,
   },
   playingIcon: {
-    color: '#ff8c5a',
+    color: theme.primary,
     fontSize: 14,
   },
   info: {
@@ -96,19 +102,19 @@ const styles = StyleSheet.create({
     gap: 2,
   },
   title: {
-    color: '#f7fbff',
+    color: theme.textPrimary,
     fontSize: 14,
     fontWeight: '700',
   },
   titleActive: {
-    color: '#ffaa80',
+    color: theme.primary,
   },
   meta: {
-    color: 'rgba(213, 226, 244, 0.55)',
+    color: theme.textMuted,
     fontSize: 11,
   },
   duration: {
-    color: 'rgba(213, 226, 244, 0.7)',
+    color: theme.textSecondary,
     fontSize: 12,
     fontFamily: 'monospace',
   },
@@ -118,10 +124,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     borderRadius: 14,
-    backgroundColor: 'rgba(248, 113, 113, 0.12)',
+    backgroundColor: theme.dangerDim,
   },
   removeText: {
-    color: '#f87171',
+    color: theme.danger,
     fontSize: 16,
     fontWeight: '700',
     lineHeight: 18,

@@ -1,5 +1,7 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useMemo } from 'react'
 import { Animated, StyleSheet, View } from 'react-native'
+import { useAppTheme } from '../hooks/useAppTheme'
+import type { AppThemeColors } from '../theme/theme'
 
 type Props = {
   isPlaying: boolean
@@ -16,6 +18,9 @@ export default function WaveformBars({
   color = '#ff6b35',
   secondaryColor = '#4e8cff',
 }: Props) {
+  const themeColors = useAppTheme()
+  const styles = useMemo(() => createStyles(themeColors), [themeColors])
+
   const bars = useRef<Animated.Value[]>(
     Array.from({ length: barCount }, () => new Animated.Value(0.2)),
   ).current
@@ -107,7 +112,7 @@ export default function WaveformBars({
   )
 }
 
-const styles = StyleSheet.create({
+const createStyles = (theme: AppThemeColors) => StyleSheet.create({
   container: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -115,7 +120,7 @@ const styles = StyleSheet.create({
     gap: 3,
     borderRadius: 12,
     overflow: 'hidden',
-    backgroundColor: 'rgba(255,255,255,0.03)',
+    backgroundColor: theme.cardBorder,
     paddingHorizontal: 12,
   },
   bar: {

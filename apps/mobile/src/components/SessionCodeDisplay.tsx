@@ -1,7 +1,9 @@
 import { StyleSheet, Text, View } from 'react-native'
 import QRCode from 'react-native-qrcode-svg'
 import * as Clipboard from 'expo-clipboard'
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
+import { useAppTheme } from '../hooks/useAppTheme'
+import type { AppThemeColors } from '../theme/theme'
 
 type Props = {
   code: string
@@ -10,6 +12,8 @@ type Props = {
 
 export default function SessionCodeDisplay({ code, showQR = false }: Props) {
   const [copied, setCopied] = useState(false)
+  const themeColors = useAppTheme()
+  const styles = useMemo(() => createStyles(themeColors), [themeColors])
 
   const handleCopy = async () => {
     try {
@@ -23,7 +27,9 @@ export default function SessionCodeDisplay({ code, showQR = false }: Props) {
     <View style={styles.container}>
       {/* Code display */}
       <View style={styles.codeWrap} onTouchEnd={() => void handleCopy()}>
-        <Text style={styles.code}>{code}</Text>
+        <Text style={styles.code} numberOfLines={1} adjustsFontSizeToFit>
+          {code}
+        </Text>
         <Text style={styles.copyHint}>{copied ? '✓ Copied!' : 'tap to copy'}</Text>
       </View>
 
@@ -34,7 +40,7 @@ export default function SessionCodeDisplay({ code, showQR = false }: Props) {
             value={`hivebeats://join/${code}`}
             size={100}
             backgroundColor="transparent"
-            color="#f7fbff"
+            color={themeColors.textPrimary}
           />
         </View>
       )}
@@ -42,7 +48,7 @@ export default function SessionCodeDisplay({ code, showQR = false }: Props) {
   )
 }
 
-const styles = StyleSheet.create({
+const createStyles = (theme: AppThemeColors) => StyleSheet.create({
   container: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -51,37 +57,32 @@ const styles = StyleSheet.create({
   codeWrap: {
     flex: 1,
     borderRadius: 20,
-    backgroundColor: 'rgba(12, 22, 40, 0.8)',
+    backgroundColor: theme.card,
     borderWidth: 1,
-    borderColor: 'rgba(255, 107, 53, 0.35)',
+    borderColor: theme.primaryDim,
     paddingVertical: 20,
     paddingHorizontal: 16,
     alignItems: 'center',
-    shadowColor: '#ff6b35',
-    shadowOpacity: 0.15,
-    shadowOffset: { width: 0, height: 4 },
-    shadowRadius: 12,
-    elevation: 4,
   },
   code: {
     fontFamily: 'monospace',
-    fontSize: 32,
+    fontSize: 28,
     fontWeight: '800',
-    letterSpacing: 6,
-    color: '#ff8c5a',
+    letterSpacing: 3,
+    color: theme.primary,
   },
   copyHint: {
     marginTop: 6,
     fontSize: 11,
-    color: 'rgba(213, 226, 244, 0.45)',
+    color: theme.textMuted,
     letterSpacing: 0.5,
     textTransform: 'uppercase',
   },
   qrWrap: {
     padding: 10,
     borderRadius: 16,
-    backgroundColor: 'rgba(255, 255, 255, 0.04)',
+    backgroundColor: theme.cardBorder,
     borderWidth: 1,
-    borderColor: 'rgba(122, 173, 255, 0.18)',
+    borderColor: theme.border,
   },
 })

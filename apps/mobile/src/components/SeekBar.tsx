@@ -1,6 +1,9 @@
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native'
+import { useMemo } from 'react'
 import Slider from '@react-native-community/slider'
 import { formatTime } from '../lib/formatters'
+import { useAppTheme } from '../hooks/useAppTheme'
+import type { AppThemeColors } from '../theme/theme'
 
 type Props = {
   positionMs: number
@@ -15,8 +18,11 @@ export default function SeekBar({
   durationMs,
   onSeek,
   readOnly = false,
-  accentColor = '#ff6b35',
 }: Props) {
+  const themeColors = useAppTheme()
+  const styles = useMemo(() => createStyles(themeColors), [themeColors])
+  const accentColor = themeColors.primary
+
   const safeMax = Math.max(1, durationMs)
   const progress = (positionMs / safeMax) * 100
 
@@ -29,9 +35,9 @@ export default function SeekBar({
         maximumValue={safeMax}
         step={500}
         value={positionMs}
-        minimumTrackTintColor={readOnly ? 'rgba(78,140,255,0.8)' : accentColor}
-        maximumTrackTintColor="rgba(255,255,255,0.1)"
-        thumbTintColor={readOnly ? 'transparent' : '#ffffff'}
+        minimumTrackTintColor={readOnly ? themeColors.accent : accentColor}
+        maximumTrackTintColor={themeColors.cardBorder}
+        thumbTintColor={readOnly ? 'transparent' : themeColors.textPrimary}
         disabled={readOnly || !onSeek}
         onSlidingComplete={(v) => {
           if (!readOnly && onSeek) onSeek(Math.round(v))
@@ -47,7 +53,7 @@ export default function SeekBar({
   )
 }
 
-const styles = StyleSheet.create({
+const createStyles = (theme: AppThemeColors) => StyleSheet.create({
   container: {
     gap: 2,
   },
@@ -60,7 +66,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   time: {
-    color: 'rgba(213, 226, 244, 0.6)',
+    color: theme.textSecondary,
     fontSize: 12,
     fontFamily: 'monospace',
   },

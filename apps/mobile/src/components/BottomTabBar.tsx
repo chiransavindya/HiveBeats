@@ -1,20 +1,26 @@
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native'
+import { useMemo } from 'react'
+import { BlurView } from 'expo-blur'
+import { Feather } from '@expo/vector-icons'
+import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import type { TabId } from '../types/session'
 import { useSessionStore } from '../store/sessionStore'
+import { useAppTheme } from '../hooks/useAppTheme'
+import type { AppThemeColors } from '../theme/theme'
 
 type TabConfig = {
   id: TabId
   label: string
-  icon: string
+  icon: keyof typeof Feather.glyphMap
   guestLabel?: string
 }
 
 const TABS: TabConfig[] = [
-  { id: 'player', label: 'Player', icon: '🎵', guestLabel: 'Listening' },
-  { id: 'queue', label: 'Queue', icon: '🎶', guestLabel: 'Request' },
-  { id: 'playlists', label: 'Playlists', icon: '📋' },
-  { id: 'network', label: 'Network', icon: '📡' },
-  { id: 'settings', label: 'Settings', icon: '⚙️' },
+  { id: 'player', label: 'Player', icon: 'music', guestLabel: 'Listening' },
+  { id: 'queue', label: 'Queue', icon: 'list', guestLabel: 'Request' },
+  { id: 'playlists', label: 'Playlists', icon: 'folder' },
+  { id: 'network', label: 'Network', icon: 'radio' },
+  { id: 'settings', label: 'Settings', icon: 'settings' },
 ]
 
 type Props = {
@@ -33,8 +39,12 @@ export default function BottomTabBar({ activeTab, onTabChange }: Props) {
 
   const isGuest = guestConnected && !hostRunning
 
+  const themeColors = useAppTheme()
+  const styles = useMemo(() => createStyles(themeColors), [themeColors])
+  const insets = useSafeAreaInsets()
+
   return (
-    <View style={styles.bar}>
+    <BlurView intensity={80} tint={themeColors.blurTint} style={[styles.bar, { paddingBottom: Math.max(insets.bottom, 4) }]}>
       {TABS.map((tab) => {
         const isActive = activeTab === tab.id
         const label = isGuest && tab.guestLabel ? tab.guestLabel : tab.label
@@ -57,9 +67,11 @@ export default function BottomTabBar({ activeTab, onTabChange }: Props) {
           >
             {/* Icon + badge wrapper */}
             <View style={styles.iconWrap}>
-              <Text style={[styles.icon, isActive && styles.iconActive]}>
-                {tab.icon}
-              </Text>
+              <Feather
+                name={tab.icon}
+                size={22}
+                color={isActive ? themeColors.primary : themeColors.textMuted}
+              />
               {badge > 0 && (
                 <View style={styles.badge}>
                   <Text style={styles.badgeText}>{badge > 9 ? '9+' : badge}</Text>
@@ -76,17 +88,22 @@ export default function BottomTabBar({ activeTab, onTabChange }: Props) {
           </TouchableOpacity>
         )
       })}
-    </View>
+    </BlurView>
   )
 }
 
-const styles = StyleSheet.create({
+const createStyles = (theme: AppThemeColors) => StyleSheet.create({
   bar: {
     flexDirection: 'row',
-    backgroundColor: 'rgba(6, 11, 22, 0.98)',
+    backgroundColor: theme.background === '#06111f' ? 'rgba(6, 11, 22, 0.65)' : 'rgba(248, 250, 252, 0.85)',
     borderTopWidth: 1,
-    borderTopColor: 'rgba(122, 173, 255, 0.15)',
+    borderTopColor: theme.border,
     paddingBottom: 4,
+    elevation: 8,
+    shadowColor: '#000',
+    shadowOpacity: 0.3,
+    shadowOffset: { width: 0, height: -2 },
+    shadowRadius: 10,
   },
   tab: {
     flex: 1,
@@ -98,22 +115,16 @@ const styles = StyleSheet.create({
   },
   iconWrap: {
     position: 'relative',
-  },
-  icon: {
-    fontSize: 20,
-    opacity: 0.45,
-  },
-  iconActive: {
-    opacity: 1,
+    marginBottom: 4,
   },
   label: {
     fontSize: 10,
-    color: 'rgba(213, 226, 244, 0.45)',
+    color: theme.textSecondary,
     fontWeight: '600',
     letterSpacing: 0.2,
   },
   labelActive: {
-    color: '#ff8c5a',
+    color: theme.primary,
   },
   activeDot: {
     position: 'absolute',
@@ -121,13 +132,13 @@ const styles = StyleSheet.create({
     width: 4,
     height: 4,
     borderRadius: 2,
-    backgroundColor: '#ff6b35',
+    backgroundColor: theme.primary,
   },
   badge: {
     position: 'absolute',
     top: -4,
     right: -8,
-    backgroundColor: '#ff6b35',
+    backgroundColor: theme.primary,
     borderRadius: 10,
     minWidth: 16,
     height: 16,

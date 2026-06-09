@@ -1,5 +1,8 @@
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native'
+import { useMemo } from 'react'
 import type { GuestDevice } from '../types/session'
+import { useAppTheme } from '../hooks/useAppTheme'
+import type { AppThemeColors } from '../theme/theme'
 
 type Props = {
   guest: GuestDevice
@@ -8,6 +11,8 @@ type Props = {
 
 export default function GuestRow({ guest, onRemove }: Props) {
   const initial = guest.alias.slice(0, 1).toUpperCase()
+  const themeColors = useAppTheme()
+  const styles = useMemo(() => createStyles(themeColors), [themeColors])
 
   return (
     <View style={styles.row}>
@@ -35,26 +40,28 @@ export default function GuestRow({ guest, onRemove }: Props) {
   )
 }
 
-const styles = StyleSheet.create({
+const createStyles = (theme: AppThemeColors) => StyleSheet.create({
   row: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
     borderRadius: 16,
-    backgroundColor: 'rgba(255, 255, 255, 0.04)',
+    backgroundColor: theme.card,
     padding: 12,
+    borderWidth: 1,
+    borderColor: theme.cardBorder,
   },
   avatar: {
     width: 38,
     height: 38,
     borderRadius: 19,
-    backgroundColor: 'rgba(78, 140, 255, 0.22)',
+    backgroundColor: theme.accentDim,
     alignItems: 'center',
     justifyContent: 'center',
     flexShrink: 0,
   },
   avatarText: {
-    color: '#ffffff',
+    color: theme.accent,
     fontWeight: '800',
     fontSize: 15,
   },
@@ -63,7 +70,7 @@ const styles = StyleSheet.create({
     gap: 3,
   },
   name: {
-    color: '#f7fbff',
+    color: theme.textPrimary,
     fontSize: 14,
     fontWeight: '700',
   },
@@ -78,25 +85,25 @@ const styles = StyleSheet.create({
     borderRadius: 3,
   },
   dotActive: {
-    backgroundColor: '#2fb87d',
+    backgroundColor: theme.success,
   },
   dotInactive: {
-    backgroundColor: 'rgba(213, 226, 244, 0.35)',
+    backgroundColor: theme.border,
   },
   status: {
-    color: 'rgba(213, 226, 244, 0.6)',
+    color: theme.textSecondary,
     fontSize: 12,
   },
   removeBtn: {
     paddingHorizontal: 12,
     paddingVertical: 7,
     borderRadius: 10,
-    backgroundColor: 'rgba(248, 113, 113, 0.1)',
+    backgroundColor: theme.dangerDim,
     borderWidth: 1,
-    borderColor: 'rgba(248, 113, 113, 0.2)',
+    borderColor: theme.dangerDim,
   },
   removeTxt: {
-    color: '#f87171',
+    color: theme.danger,
     fontSize: 12,
     fontWeight: '700',
   },
