@@ -5,7 +5,10 @@ import type { SocketMessagePayload, SocketStatusPayload } from './types/socket'
 import type { UdpAnnouncement } from './types/udp'
 
 interface Window {
+	ipcRenderer: import('electron').IpcRenderer
 	hivebeats: {
+		getLocalIp: () => Promise<string>
+		setTheme: (theme: 'system' | 'light' | 'dark') => Promise<void>
 		startDiscovery: () => Promise<{ ok: boolean }>
 		stopDiscovery: () => Promise<{ ok: boolean }>
 		advertiseSession: (sessionCode: string, port: number) => Promise<{ ok: boolean }>
@@ -15,6 +18,7 @@ interface Window {
 		startHost: (port: number) => Promise<{ ok: boolean }>
 		stopHost: () => Promise<{ ok: boolean }>
 		connectToHost: (host: string, port: number) => Promise<{ ok: boolean }>
+		kickGuest: (clientId: string) => Promise<{ ok: boolean }>
 		disconnectFromHost: () => Promise<{ ok: boolean }>
 		sendToHost: (message: unknown) => Promise<{ ok: boolean }>
 		sendToGuest: (clientId: string, message: unknown) => Promise<{ ok: boolean }>

@@ -30,6 +30,8 @@ declare global {
   interface Window {
     ipcRenderer: import('electron').IpcRenderer
     hivebeats: {
+      getLocalIp: () => Promise<string>
+      setTheme: (theme: 'system' | 'light' | 'dark') => Promise<void>
       startDiscovery: () => Promise<{ ok: true }>
       stopDiscovery: () => Promise<{ ok: true }>
       advertiseSession: (sessionCode: string, port: number) => Promise<{ ok: true }>
@@ -43,6 +45,7 @@ declare global {
       startHost: (port: number) => Promise<{ ok: true }>
       stopHost: () => Promise<{ ok: true }>
       connectToHost: (host: string, port: number) => Promise<{ ok: true }>
+      kickGuest: (clientId: string) => Promise<{ ok: true }>
       disconnectFromHost: () => Promise<{ ok: true }>
       sendToHost: (message: unknown) => Promise<{ ok: boolean }>
       sendToGuest: (clientId: string, message: unknown) => Promise<{ ok: boolean }>

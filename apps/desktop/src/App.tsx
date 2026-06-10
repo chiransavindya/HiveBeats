@@ -16,12 +16,11 @@ import type {
   ReadyAckMessage,
   ReadyRequestMessage,
   SeekCommandMessage,
-  StreamChunkMessage,
-  StreamEndMessage,
   StreamMessage,
   SyncPingMessage,
   SyncPongMessage,
 } from './types/streaming'
+import { QRCodeSVG } from 'qrcode.react'
 import './App.css'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -148,9 +147,9 @@ function App() {
   const [manualHost, setManualHost] = useState('')
   const [hostRunning, setHostRunning] = useState(false)
   const [guestConnected, setGuestConnected] = useState(false)
-  const [guestCount, setGuestCount] = useState(0)
   const [guestHostId, setGuestHostId] = useState('')
   const [guestList, setGuestList] = useState<GuestInfo[]>([])
+  const [localIp, setLocalIp] = useState<string>('127.0.0.1')
   const [hostError, setHostError] = useState<string | null>(null)
   const [guestError, setGuestError] = useState<string | null>(null)
   const [udpError, setUdpError] = useState<string | null>(null)
@@ -220,11 +219,6 @@ function App() {
   const guestSeekTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hostAudioRef = useRef<HTMLAudioElement | null>(null)
   const guestAudioRef = useRef<HTMLAudioElement | null>(null)
-  const mediaSourceRef = useRef<MediaSource | null>(null)
-  const sourceBufferRef = useRef<SourceBuffer | null>(null)
-  const chunkQueueRef = useRef<Uint8Array[]>([])
-  const streamEndPendingRef = useRef(false)
-  const guestBufferedBytesRef = useRef(0)
   const guestReadySentRef = useRef(false)
   const guestReadyRequestedRef = useRef(false)
   const guestReadyAcknowledgedRef = useRef(false)
@@ -238,6 +232,7 @@ function App() {
   const guestReadyIdsRef = useRef<Set<string>>(new Set())
   const hostCommandSeqRef = useRef(0)
   const guestLastCommandIdRef = useRef(-1)
+  const connectionTargetRef = useRef<{ host: string; port: number } | null>(null)
   const transportEpochRef = useRef(0)
   // Stash a CMD_PLAY received before clock sync is ready; applied once SYNC_PONG arrives.
   const pendingCmdPlayRef = useRef<{ command: ExtendedPlayCommand; incomingEpoch: number | undefined } | null>(null)
@@ -290,14 +285,9 @@ function App() {
   const filePathToUrl = (filePath: string) => {
     const normalized = filePath.replace(/\\/g, '/')
     const withLeadingSlash = normalized.startsWith('/') ? normalized : `/${normalized}`
-    return `hivebeats://file${withLeadingSlash}`
-  }
-
-  const decodeBase64 = (data: string) => {
-    const binary = atob(data)
-    const bytes = new Uint8Array(binary.length)
-    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
-    return bytes
+    // We must encode the path because new URL() throws on spaces
+    const encodedPath = withLeadingSlash.split('/').map(encodeURIComponent).join('/')
+    return `hivebeats://file${encodedPath}`
   }
 
   // ─── Visualizer ────────────────────────────────────────────────────────────
@@ -382,6 +372,11 @@ function App() {
     if (!audio) return
     audio.volume = guestMuted ? 0 : guestVolume
   }, [guestMuted, guestVolume])
+
+  // Keep connectionTargetRef updated
+  useEffect(() => {
+    connectionTargetRef.current = connectionTarget
+  }, [connectionTarget])
 
   // ─── Keyboard shortcuts ────────────────────────────────────────────────────
 
@@ -635,17 +630,6 @@ function App() {
     return 0
   }, [])
 
-  const appendNextChunk = useCallback(() => {
-    const sourceBuffer = sourceBufferRef.current
-    if (!sourceBuffer || sourceBuffer.updating) return
-    const chunk = chunkQueueRef.current.shift()
-    if (chunk) { sourceBuffer.appendBuffer(Uint8Array.from(chunk).buffer); return }
-    if (streamEndPendingRef.current && mediaSourceRef.current?.readyState === 'open') {
-      streamEndPendingRef.current = false
-      mediaSourceRef.current.endOfStream()
-    }
-  }, [])
-
   const areAllGuestsReady = useCallback((readyIds: Set<string>, guests: GuestInfo[]) => {
     if (guests.length === 0) return true
     return guests.every((guest) => readyIds.has(guest.id))
@@ -735,14 +719,14 @@ function App() {
   }, [selectedTrack])
 
   const requestGuestReady = useCallback(async () => {
-    if (!selectedTrack || guestCount <= 0) return
+    if (!selectedTrack || guestList.length <= 0) return
     const audio = hostAudioRef.current
     const positionMs = audio ? audio.currentTime * 1000 : 0
     const message: ReadyRequestMessage = { type: 'READY_REQUEST', trackId: selectedTrack.id, positionMs }
     resetHostReadiness()
     await window.hivebeats.broadcastToGuests(message)
     addLog('Requested guests to get ready')
-  }, [addLog, guestCount, resetHostReadiness, selectedTrack])
+  }, [addLog, guestList.length, resetHostReadiness, selectedTrack])
 
   const checkGuestReady = useCallback(() => {
     if (guestReadySentRef.current) return
@@ -755,7 +739,7 @@ function App() {
       audio.currentTime = targetSeconds; return
     }
     if (audio.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return
-    if (bufferedAhead >= GUEST_READY_BUFFER_SECONDS) {
+    if (audio.readyState === HTMLMediaElement.HAVE_ENOUGH_DATA || bufferedAhead >= GUEST_READY_BUFFER_SECONDS) {
       guestReadySentRef.current = true
       guestStreamReadyRef.current = true
       setGuestStreamReady(true)
@@ -779,44 +763,28 @@ function App() {
     addLog('Ready sent to host')
   }, [addLog])
 
-  const resetGuestStream = useCallback((mimeType: string, fileName: string) => {
+  const resetGuestStream = useCallback((mimeType: string, fileName: string, trackId: string, host: string, port: number) => {
     const audio = guestAudioRef.current
     if (!audio) return
     clearGuestTransportTimers()
     guestLastCommandIdRef.current = -1
-    mediaSourceRef.current = null
-    sourceBufferRef.current = null
-    chunkQueueRef.current = []
-    streamEndPendingRef.current = false
-    guestBufferedBytesRef.current = 0
     guestReadySentRef.current = false
     guestReadyAcknowledgedRef.current = false
     guestStreamReadyRef.current = false
     guestSyncReadyRef.current = false
-    guestTrackIdRef.current = null
+    guestTrackIdRef.current = trackId
     setGuestStreamReady(false)
     setGuestSyncReady(false)
     setGuestReadyAcknowledged(false)
     setGuestTrackName(fileName)
     setGuestPositionMs(0)
     setGuestDurationMs(0)
-    const mediaSource = new MediaSource()
-    mediaSourceRef.current = mediaSource
-    audio.src = URL.createObjectURL(mediaSource)
-    mediaSource.addEventListener('sourceopen', () => {
-      if (!mediaSourceRef.current || mediaSourceRef.current.readyState !== 'open') return
-      try {
-        const sourceBuffer = mediaSource.addSourceBuffer(mimeType)
-        sourceBufferRef.current = sourceBuffer
-        sourceBuffer.addEventListener('updateend', () => {
-          appendNextChunk()
-          checkGuestReady()
-          void trySendReadyAck()
-        })
-        appendNextChunk()
-      } catch { setGuestError('Stream mime type not supported on this device.') }
-    })
-  }, [appendNextChunk, checkGuestReady, clearGuestTransportTimers, trySendReadyAck])
+
+    const ext = mimeType === 'audio/wav' ? '.wav' : mimeType === 'audio/flac' ? '.flac' : mimeType === 'audio/aac' ? '.aac' : mimeType === 'audio/mp4' ? '.m4a' : mimeType === 'audio/ogg' ? '.ogg' : '.mp3'
+    const streamUrl = `http://${host}:${port}/stream${ext}?trackId=${trackId}`
+    audio.src = streamUrl
+    audio.load()
+  }, [clearGuestTransportTimers])
 
 
   // ─── Discovery helpers ─────────────────────────────────────────────────────
@@ -852,7 +820,20 @@ function App() {
 
   const connectToHost = async (host: string, port: number) => {
     if (!host) { setGuestError('Missing host address.'); return }
+    if (guestAudioRef.current) {
+      // Set to a tiny silent WAV file to successfully play and unlock the audio element!
+      guestAudioRef.current.src = "data:audio/wav;base64,UklGRjIAAABXQVZFZm10IBIAAAABAAEAQB8AAEAfAAABAAgAAABmYWN0BAAAAAAAAABkYXRhAAAAAA=="
+      guestAudioRef.current.play()
+        .then(() => {
+          guestAudioRef.current?.pause()
+          addLog('Guest audio player unlocked successfully')
+        })
+        .catch((err) => {
+          console.warn('Unlock failed:', err)
+        })
+    }
     setConnectionTarget({ host, port })
+    connectionTargetRef.current = { host, port }
     setRetryCount(0)
     setGuestError(null)
     await attemptConnect(host, port, 'Connecting to')
@@ -1011,7 +992,7 @@ function App() {
       addLog('Streaming to guests')
     }
     const positionMs = audio.currentTime * 1000
-    if (guestCount > 0 && !areAllGuestsReady(guestReadyIdsRef.current, guestList)) {
+    if (guestList.length > 0 && !areAllGuestsReady(guestReadyIdsRef.current, guestList)) {
       setPendingPlay(true)
       pendingPlayRef.current = true
       pendingPlaybackPositionRef.current = positionMs
@@ -1082,7 +1063,7 @@ function App() {
     await window.hivebeats.stopAdvertise()
     await window.hivebeats.stopUdpBroadcast()
     await window.hivebeats.stopStream()
-    setHostRunning(false); setGuestCount(0); setGuestList([])
+    setHostRunning(false); setGuestList([])
     setStreamingTrackId(null); setPendingPlay(false); pendingPlayRef.current = false
     guestReadyIdsRef.current.clear()
     addLog('Host stopped')
@@ -1091,7 +1072,9 @@ function App() {
   const handleDisconnect = async () => {
     clearGuestTransportTimers()
     await window.hivebeats.disconnectFromHost()
-    setConnectionTarget(null); setRetryCount(0)
+    setConnectionTarget(null)
+    connectionTargetRef.current = null
+    setRetryCount(0)
     if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null }
     setGuestConnected(false); setGuestHostId('')
     setGuestTrackName(''); setGuestPositionMs(0); setGuestDurationMs(0)
@@ -1100,6 +1083,10 @@ function App() {
   }
 
   // ─── Effects ───────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    window.hivebeats.getLocalIp().then(setLocalIp).catch(console.error)
+  }, [])
 
   // mDNS + UDP discovery
   useEffect(() => {
@@ -1190,17 +1177,34 @@ function App() {
     const audio = guestAudioRef.current
     if (!audio) return
     const handleGuestCanPlay = () => { checkGuestReady(); void trySendReadyAck() }
+    const handleGuestCanPlayThrough = () => {
+      if (guestReadyAcknowledgedRef.current) return
+      guestStreamReadyRef.current = true; setGuestStreamReady(true)
+      guestSyncReadyRef.current = true; setGuestSyncReady(true)
+      guestReadySentRef.current = true
+      addLog('Guest audio can play through (ready)')
+      void trySendReadyAck()
+    }
+    const handleGuestError = () => {
+      const err = audio.error
+      addLog(`Guest audio element error: ${err?.message || 'unknown error'} (code ${err?.code})`)
+      setGuestError(`Audio element error: ${err?.message || 'unknown error'} (code ${err?.code})`)
+    }
     audio.addEventListener('canplay', handleGuestCanPlay)
+    audio.addEventListener('canplaythrough', handleGuestCanPlayThrough)
     audio.addEventListener('seeked', handleGuestCanPlay)
     audio.addEventListener('loadedmetadata', handleGuestCanPlay)
     audio.addEventListener('progress', handleGuestCanPlay)
+    audio.addEventListener('error', handleGuestError)
     return () => {
       audio.removeEventListener('canplay', handleGuestCanPlay)
+      audio.removeEventListener('canplaythrough', handleGuestCanPlayThrough)
       audio.removeEventListener('seeked', handleGuestCanPlay)
       audio.removeEventListener('loadedmetadata', handleGuestCanPlay)
       audio.removeEventListener('progress', handleGuestCanPlay)
+      audio.removeEventListener('error', handleGuestError)
     }
-  }, [checkGuestReady, trySendReadyAck])
+  }, [checkGuestReady, trySendReadyAck, addLog])
 
   // Host advertisement sync
   useEffect(() => {
@@ -1216,7 +1220,6 @@ function App() {
     const cleanupStatus = window.hivebeats.onSocketStatus((status: SocketStatusPayload) => {
       if (status.role === 'host') {
         if (status.status === 'client-connected') {
-          setGuestCount((count) => count + 1)
           setGuestList((current) => {
             if (!status.address || !status.clientId) return current
             if (current.some((guest) => guest.id === status.clientId)) return current
@@ -1226,7 +1229,6 @@ function App() {
           addLog(`Guest connected (${status.address})`)
         }
         if (status.status === 'client-disconnected') {
-          setGuestCount((count) => Math.max(0, count - 1))
           setGuestList((current) => current.filter((guest) => guest.id !== status.clientId))
           if (status.clientId) guestReadyIdsRef.current.delete(status.clientId)
           addLog('Guest disconnected')
@@ -1262,6 +1264,14 @@ function App() {
           const helloMsg = payload.message as HostHelloMessage
           const clientId = payload.clientId
           const reply: HostWelcomeMessage = { type: 'WELCOME', sessionCode, hostId: deviceId }
+          
+          if (helloMsg.alias === 'Scanner') {
+            setGuestList((current) => current.filter((guest) => guest.id !== clientId))
+            window.hivebeats.sendToGuest(clientId, reply)
+            setTimeout(() => void window.hivebeats.kickGuest(clientId), 200)
+            return
+          }
+
           setGuestList((current) => current.map((guest) => guest.id === clientId ? { ...guest, alias: helloMsg.alias } : guest))
           window.hivebeats.sendToGuest(clientId, reply)
           if (selectedTrack) {
@@ -1311,6 +1321,7 @@ function App() {
         const message = payload.message as { type: string, [key: string]: any }
         if (message.type === 'WELCOME') {
           setGuestHostId(message.hostId as string)
+          setSessionCode(message.sessionCode as string)
           addLog(`Joined session ${message.sessionCode as string}`)
         }
 
@@ -1368,7 +1379,7 @@ function App() {
           checkGuestReady(); void trySendReadyAck(); return
         }
         if (streamMessage.type === 'STREAM_INIT') {
-          resetGuestStream(streamMessage.mimeType as string, streamMessage.fileName as string)
+          resetGuestStream(streamMessage.mimeType as string, streamMessage.fileName as string, streamMessage.trackId as string, connectionTargetRef.current?.host || '', connectionTargetRef.current?.port || 7400)
           guestTrackIdRef.current = streamMessage.trackId as string
           setGuestTrackId(streamMessage.trackId as string)
           setGuestError(null)
@@ -1378,17 +1389,7 @@ function App() {
           window.hivebeats.sendToHost({ type: 'SYNC_PING', t0: Date.now() })
           return
         }
-        if (streamMessage.type === 'STREAM_CHUNK') {
-          const chunkMsg = streamMessage as unknown as StreamChunkMessage
-          chunkQueueRef.current.push(decodeBase64(chunkMsg.data))
-          guestBufferedBytesRef.current += chunkMsg.data.length
-          appendNextChunk(); checkGuestReady(); void trySendReadyAck(); return
-        }
-        if (streamMessage.type === 'STREAM_END') {
-          const endMsg = streamMessage as unknown as StreamEndMessage
-          if (endMsg.trackId === guestTrackId) { streamEndPendingRef.current = true; appendNextChunk() }
-          return
-        }
+
 
         const playCmd = streamMessage as unknown as ExtendedPlayCommand
         const pauseCmd = streamMessage as unknown as ExtendedPauseCommand
@@ -1452,7 +1453,7 @@ function App() {
 
     return () => { cleanupStatus(); cleanupMessage() }
   }, [
-    addLog, appendNextChunk, checkGuestReady, clearGuestTransportTimers,
+    addLog, checkGuestReady, clearGuestTransportTimers,
     deviceId, guestList, guestPendingRequest, guestTrackId,
     maybeStartPendingPlayback, requestGuestReadyAt, resetGuestStream,
     scheduleRetry, sendHello, selectedTrack, sendPlayToGuest,
@@ -1491,14 +1492,19 @@ function App() {
       {/* Session */}
       <div className="panel panel--accent panel--session">
         <p className="panel-title">Your Session</p>
-        <div className="session-code-display" aria-live="polite">{sessionCode}</div>
+        <div style={{ display: 'flex', flexDirection: 'row', gap: '16px', alignItems: 'center', marginBottom: '16px' }}>
+          <div className="session-code-display" aria-live="polite" style={{ flex: 1, margin: 0 }}>{sessionCode}</div>
+          <div style={{ background: 'white', padding: '6px', borderRadius: '8px' }}>
+            <QRCodeSVG value={`hivebeats://${localIp}:${hostPort}?code=${sessionCode}`} size={64} />
+          </div>
+        </div>
         <div className="btn-row">
           <button className="btn btn--ghost" onClick={handleNewCode}>New Code</button>
           <button className="btn btn--danger" onClick={handleStopHost}>Stop Host</button>
         </div>
         <div className="meta-row">
           <span><span className="status-dot status-dot--live" style={{ display: 'inline-block', marginRight: 5 }} />Live</span>
-          <span>{guestCount} guest{guestCount !== 1 ? 's' : ''}</span>
+          <span>{guestList.length} guest{guestList.length !== 1 ? 's' : ''}</span>
           <span style={{ fontFamily: 'monospace', fontSize: '0.75rem' }}>{deviceAlias}</span>
         </div>
         {/* Queue permission toggle */}
@@ -1685,7 +1691,7 @@ function App() {
             <button
               className="btn btn--ghost"
               onClick={requestGuestReady}
-              disabled={!selectedTrack || guestCount === 0}
+              disabled={!selectedTrack || guestList.length === 0}
               style={{ padding: '5px 12px', fontSize: '0.75rem' }}
               title="Ask all guests to re-buffer and re-sync clocks. Use if a guest stays on WAITING after you pick a track."
             >
@@ -2209,7 +2215,7 @@ function App() {
         </div>
         <div className="header-status">
           {isHost && (
-            <><span className="status-dot status-dot--live" /><span>Hosting · {guestCount} guest{guestCount !== 1 ? 's' : ''}</span></>
+            <><span className="status-dot status-dot--live" /><span>Hosting · {guestList.length} guest{guestList.length !== 1 ? 's' : ''}</span></>
           )}
           {isGuest && (
             <><span className="status-dot status-dot--connected" /><span>Connected to session</span></>

@@ -5,6 +5,8 @@ export function ensurePreviewBridge() {
   if (window.hivebeats) return
 
   window.hivebeats = {
+    getLocalIp: async () => '192.168.1.100',
+    setTheme: ok as any,
     startDiscovery: ok,
     stopDiscovery: ok,
     advertiseSession: ok,
@@ -14,6 +16,7 @@ export function ensurePreviewBridge() {
     startHost: ok,
     stopHost: ok,
     connectToHost: ok,
+    kickGuest: ok,
     disconnectFromHost: ok,
     sendToHost: ok,
     sendToGuest: ok,

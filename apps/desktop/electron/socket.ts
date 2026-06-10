@@ -1,9 +1,15 @@
 import { randomUUID } from 'node:crypto'
 import { createServer, type IncomingMessage } from 'node:http'
-import { createWriteStream } from 'node:fs'
+import { createWriteStream, createReadStream, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, extname } from 'node:path'
 import WebSocket, { WebSocketServer, type RawData } from 'ws'
+
+let activeStreamFilePath: string | null = null
+
+export function setActiveStreamFilePath(filePath: string | null) {
+  activeStreamFilePath = filePath
+}
 
 type HostClient = {
   id: string
@@ -37,8 +43,8 @@ export function startHost(port: number, handlers: HostHandlers) {
   httpServer = createServer((req, res) => {
     // Handle CORS
     res.setHeader('Access-Control-Allow-Origin', '*')
-    res.setHeader('Access-Control-Allow-Methods', 'OPTIONS, POST')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Filename')
+    res.setHeader('Access-Control-Allow-Methods', 'OPTIONS, GET, POST')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Filename, Range')
 
     if (req.method === 'OPTIONS') {
       res.writeHead(200)
@@ -65,6 +71,88 @@ export function startHost(port: number, handlers: HostHandlers) {
         res.writeHead(500)
         res.end()
       })
+      return
+    }
+
+    if ((req.method === 'GET' || req.method === 'HEAD') && req.url?.startsWith('/stream')) {
+      console.log(`[HTTP Stream] ${req.method} request from ${req.socket.remoteAddress}. URL: ${req.url}, Range: ${req.headers.range}`)
+      if (!activeStreamFilePath) {
+        console.warn('[HTTP Stream] 404: No active stream file path set.')
+        res.writeHead(404)
+        return res.end()
+      }
+
+      let stat
+      try {
+        stat = statSync(activeStreamFilePath)
+      } catch (e) {
+        console.error('[HTTP Stream] 404: Failed to stat stream file:', e)
+        res.writeHead(404)
+        return res.end()
+      }
+
+      const fileSize = stat.size
+      const range = req.headers.range
+
+      const ext = extname(activeStreamFilePath).toLowerCase()
+      const mimeType = ext === '.wav' ? 'audio/wav' : ext === '.flac' ? 'audio/flac' : ext === '.aac' ? 'audio/aac' : ext === '.ogg' ? 'audio/ogg' : ext === '.m4a' ? 'audio/mp4' : 'audio/mpeg'
+
+      if (req.method === 'HEAD') {
+        res.writeHead(200, {
+          'Content-Length': fileSize,
+          'Content-Type': mimeType,
+          'Accept-Ranges': 'bytes',
+          'Cache-Control': 'no-store',
+        })
+        return res.end()
+      }
+
+      if (range) {
+        const parts = range.replace(/bytes=/, '').split('-')
+        const start = parseInt(parts[0], 10) || 0
+        const parsedEnd = parseInt(parts[1], 10)
+        const end = isNaN(parsedEnd) ? fileSize - 1 : Math.min(parsedEnd, fileSize - 1)
+
+        if (start >= fileSize) {
+          console.warn(`[HTTP Stream] 416 Content-Range Out of Bounds: start ${start} >= fileSize ${fileSize}`)
+          res.writeHead(416, { 'Content-Range': `bytes */${fileSize}` })
+          return res.end()
+        }
+
+        const chunksize = (end - start) + 1
+        const head = {
+          'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': chunksize,
+          'Content-Type': mimeType,
+        }
+        console.log(`[HTTP Stream] Serving 206 Partial Content: bytes ${start}-${end}/${fileSize}`)
+        res.writeHead(206, head)
+        
+        const file = createReadStream(activeStreamFilePath, { start, end })
+        file.on('error', (err) => {
+          console.error('[HTTP Stream] Read stream error:', err)
+          if (!res.headersSent) res.writeHead(500)
+          res.end()
+        })
+        file.pipe(res)
+      } else {
+        const head = {
+          'Content-Length': fileSize,
+          'Content-Type': mimeType,
+          'Accept-Ranges': 'bytes',
+        }
+        console.log(`[HTTP Stream] Serving 200 OK: full file ${fileSize} bytes`)
+        res.writeHead(200, head)
+        
+        const file = createReadStream(activeStreamFilePath)
+        file.on('error', (err) => {
+          console.error('[HTTP Stream] Read stream error:', err)
+          if (!res.headersSent) res.writeHead(500)
+          res.end()
+        })
+        file.pipe(res)
+      }
       return
     }
 
@@ -103,7 +191,7 @@ export function startHost(port: number, handlers: HostHandlers) {
     handlers.onHostError?.(error as Error)
   })
 
-  httpServer.listen(port)
+  httpServer.listen(port, '0.0.0.0')
 }
 
 export function stopHost() {
@@ -133,6 +221,14 @@ export function sendToGuest(clientId: string, message: string) {
   }
 
   return false
+}
+
+export function disconnectGuest(clientId: string) {
+  const client = clients.get(clientId)
+  if (client) {
+    client.socket.close()
+    clients.delete(clientId)
+  }
 }
 
 export function connectToHost(host: string, port: number, handlers: GuestHandlers) {

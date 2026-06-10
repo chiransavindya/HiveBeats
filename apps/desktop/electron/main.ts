@@ -3,17 +3,19 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import type { Service } from 'bonjour-service'
 import { advertiseSession, destroyBonjour, startDiscovery } from './mdns'
-import { startFileStream, type StreamController } from './streamer'
+import { type StreamController } from './streamer'
 import {
   broadcastToGuests,
   connectToHost,
   disconnectFromHost,
+  disconnectGuest,
   sendToGuest,
   sendToHost,
   startHost,
   stopHost,
+  setActiveStreamFilePath,
 } from './socket'
-import { startBroadcast, startListener, stopBroadcast, stopListener } from './udp'
+import { startBroadcast, startListener, stopBroadcast, stopListener, startSubnetScanner, stopSubnetScanner } from './udp'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -41,6 +43,8 @@ protocol.registerSchemesAsPrivileged([
 // │
 process.env.APP_ROOT = path.join(__dirname, '..')
 
+import { networkInterfaces } from 'node:os'
+
 // 🚧 Use ['ENV_NAME'] avoid vite:define plugin - Vite@2.x
 export const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
 export const MAIN_DIST = path.join(process.env.APP_ROOT, 'dist-electron')
@@ -52,70 +56,12 @@ let win: BrowserWindow | null
 let advertisedService: Service | null = null
 let stopDiscovery: (() => void) | null = null
 let stopUdpListener: (() => void) | null = null
-let activeStream: StreamController | null = null
 let activeStreamTrackId: string | null = null
 const clientStreams = new Map<string, StreamController>()
 
 function stopClientStream(clientId: string) {
   clientStreams.get(clientId)?.stop()
   clientStreams.delete(clientId)
-}
-
-function streamTrackToGuest(payload: {
-  clientId: string
-  filePath: string
-  fileName: string
-  mimeType: string
-  trackId: string
-}) {
-  stopClientStream(payload.clientId)
-
-  sendToGuest(
-    payload.clientId,
-    JSON.stringify({
-      type: 'STREAM_INIT',
-      trackId: payload.trackId,
-      fileName: payload.fileName,
-      mimeType: payload.mimeType,
-    }),
-  )
-
-  const stream = startFileStream(payload.filePath, 64 * 1024, {
-    onChunk: (chunk, seq) => {
-      sendToGuest(
-        payload.clientId,
-        JSON.stringify({
-          type: 'STREAM_CHUNK',
-          trackId: payload.trackId,
-          seq,
-          data: chunk.toString('base64'),
-        }),
-      )
-    },
-    onEnd: () => {
-      sendToGuest(
-        payload.clientId,
-        JSON.stringify({
-          type: 'STREAM_END',
-          trackId: payload.trackId,
-        }),
-      )
-      clientStreams.delete(payload.clientId)
-    },
-    onError: (error) => {
-      sendToGuest(
-        payload.clientId,
-        JSON.stringify({
-          type: 'STREAM_END',
-          trackId: payload.trackId,
-          error: error.message,
-        }),
-      )
-      clientStreams.delete(payload.clientId)
-    },
-  })
-
-  clientStreams.set(payload.clientId, stream)
 }
 
 function createWindow() {
@@ -165,6 +111,18 @@ function createWindow() {
 
 ipcMain.handle('theme:set', (_event, theme: 'system' | 'light' | 'dark') => {
   nativeTheme.themeSource = theme
+})
+
+ipcMain.handle('network:get-ip', () => {
+  const nets = networkInterfaces()
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name] || []) {
+      if (net.family === 'IPv4' && !net.internal) {
+        return net.address
+      }
+    }
+  }
+  return '127.0.0.1'
 })
 
 ipcMain.handle('mdns:advertise', (_event, payload: { sessionCode: string; port: number }) => {
@@ -239,6 +197,11 @@ ipcMain.handle('socket:stop-host', (event) => {
   return { ok: true }
 })
 
+ipcMain.handle('socket:kick-guest', (_event, payload: { clientId: string }) => {
+  disconnectGuest(payload.clientId)
+  return { ok: true }
+})
+
 ipcMain.handle('socket:connect', (event, payload: { host: string; port: number }) => {
   connectToHost(payload.host, payload.port, {
     onConnected: () => {
@@ -308,14 +271,9 @@ ipcMain.handle('dialog:pick-audio', async () => {
 })
 
 ipcMain.handle('stream:start', (_event, payload: { filePath: string; fileName: string; mimeType: string; trackId: string }) => {
-  activeStream?.stop()
   activeStreamTrackId = payload.trackId
-
-  // Stop any per-guest streams before starting the broadcast stream.
-  // Both streams write to the same WebSocket connection for each guest;
-  // running them concurrently interleaves chunks and corrupts the MediaSource buffer.
-  clientStreams.forEach((stream) => stream.stop())
-  clientStreams.clear()
+  
+  setActiveStreamFilePath(payload.filePath)
 
   broadcastToGuests(
     JSON.stringify({
@@ -326,50 +284,29 @@ ipcMain.handle('stream:start', (_event, payload: { filePath: string; fileName: s
     }),
   )
 
-  activeStream = startFileStream(payload.filePath, 64 * 1024, {
-    onChunk: (chunk, seq) => {
-      broadcastToGuests(
-        JSON.stringify({
-          type: 'STREAM_CHUNK',
-          trackId: payload.trackId,
-          seq,
-          data: chunk.toString('base64'),
-        }),
-      )
-    },
-    onEnd: () => {
-      broadcastToGuests(
-        JSON.stringify({
-          type: 'STREAM_END',
-          trackId: payload.trackId,
-        }),
-      )
-    },
-    onError: (error) => {
-      broadcastToGuests(
-        JSON.stringify({
-          type: 'STREAM_END',
-          trackId: payload.trackId,
-          error: error.message,
-        }),
-      )
-    },
-  })
-
   return { ok: true }
 })
 
 ipcMain.handle(
   'stream:start-for-guest',
   (_event, payload: { clientId: string; filePath: string; fileName: string; mimeType: string; trackId: string }) => {
-    streamTrackToGuest(payload)
+    // We only need to tell the guest to initialize the stream.
+    // The HTTP server handles the actual streaming.
+    sendToGuest(
+      payload.clientId,
+      JSON.stringify({
+        type: 'STREAM_INIT',
+        trackId: payload.trackId,
+        fileName: payload.fileName,
+        mimeType: payload.mimeType,
+      }),
+    )
     return { ok: true }
   },
 )
 
 ipcMain.handle('stream:stop', () => {
-  activeStream?.stop()
-  activeStream = null
+  setActiveStreamFilePath(null)
   clientStreams.forEach((stream) => stream.stop())
   clientStreams.clear()
   if (activeStreamTrackId) {
@@ -411,13 +348,33 @@ ipcMain.handle('udp:stop-broadcast', () => {
 
 ipcMain.handle('udp:start-listen', (event, payload: { broadcastPort: number; deviceId: string }) => {
   stopUdpListener?.()
+  const sender = event.sender
+
   startListener(
     payload.broadcastPort,
     payload.deviceId,
-    (announcement) => event.sender.send('udp:announcement', announcement),
-    (error) => event.sender.send('udp:error', { message: error.message }),
+    (announcement) => {
+      sender.send('udp:announcement', announcement)
+    },
+    (error) => {
+      sender.send('udp:error', { message: error.message })
+    },
   )
-  stopUdpListener = () => stopListener()
+  
+  // Also start subnet scanner to find Expo Go hosts that cannot send UDP
+  startSubnetScanner(
+    7400, // assume 7400 as default host port
+    payload.deviceId,
+    (announcement) => {
+      sender.send('udp:announcement', announcement)
+    }
+  )
+
+  stopUdpListener = () => {
+    stopListener()
+    stopSubnetScanner()
+  }
+
   return { ok: true }
 })
 

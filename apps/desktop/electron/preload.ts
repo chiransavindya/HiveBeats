@@ -24,6 +24,9 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
 })
 
 contextBridge.exposeInMainWorld('hivebeats', {
+  getLocalIp() {
+    return ipcRenderer.invoke('network:get-ip')
+  },
   setTheme(theme: 'system' | 'light' | 'dark') {
     return ipcRenderer.invoke('theme:set', theme)
   },
@@ -57,6 +60,9 @@ contextBridge.exposeInMainWorld('hivebeats', {
   },
   connectToHost(host: string, port: number) {
     return ipcRenderer.invoke('socket:connect', { host, port })
+  },
+  kickGuest(clientId: string) {
+    return ipcRenderer.invoke('socket:kick-guest', { clientId })
   },
   disconnectFromHost() {
     return ipcRenderer.invoke('socket:disconnect')
