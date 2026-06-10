@@ -45,76 +45,58 @@ export default function GuestSessionScreen() {
       <AppHeader showStatus />
 
       {/* ── Now Listening ───────────────────────────────────────────────── */}
-      <SectionCard
-        title="Now Listening"
-        rightSlot={
-          <TouchableOpacity
-            style={styles.disconnectBtn}
-            onPress={() => setShowLeaveModal(true)}
-          >
-            <Text style={styles.disconnectText}>Leave</Text>
-          </TouchableOpacity>
-        }
-      >
-        {/* Stream + sync status */}
-        <View style={styles.statusBadges}>
-          <StatusChip
-            label={guestStreamReady ? '● Stream Ready' : '○ Buffering'}
-            tone={guestStreamReady ? 'good' : 'warning'}
-          />
-          <StatusChip
-            label={guestSyncReady ? '● Synced' : '○ Syncing'}
-            tone={guestSyncReady ? 'good' : 'warning'}
-          />
-        </View>
-
+      <SectionCard>
         {/* Track artwork + info */}
         <View style={styles.trackInfo}>
           <View style={[styles.artwork, guestStreamReady && styles.artworkActive]}>
             <Feather name="headphones" size={28} color={themeColors.accent} />
           </View>
           <View style={styles.trackDetails}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+              <StatusChip label="LIVE" tone="live" />
+              {!guestStreamReady && <StatusChip label="Buffering" tone="warning" />}
+              {guestStreamReady && !guestSyncReady && <StatusChip label="Syncing" tone="warning" />}
+            </View>
             {guestTrackName ? (
-              <>
-                <Text style={styles.trackTitle} numberOfLines={2}>{guestTrackName}</Text>
-                <Text style={styles.trackMeta}>
-                  {formatTime(guestPositionMs)} / {formatTime(guestDurationMs)}
-                </Text>
-              </>
+              <Text style={styles.trackTitle} numberOfLines={2}>{guestTrackName}</Text>
             ) : (
               <>
                 <Text style={styles.waitingTitle}>Waiting for host…</Text>
-                <Text style={styles.waitingMeta}>Host hasn't started playback yet</Text>
+                <Text style={styles.waitingMeta}>Host hasn't started playback</Text>
               </>
             )}
           </View>
+          <TouchableOpacity onPress={() => setShowLeaveModal(true)} style={styles.iconBtn}>
+            <Feather name="log-out" size={16} color={themeColors.danger} />
+          </TouchableOpacity>
         </View>
 
-        {/* Progress bar (read-only — host controls position) */}
-        {guestTrackName ? (
-          <SeekBar
-            positionMs={guestPositionMs}
-            durationMs={guestDurationMs}
-            readOnly
-            accentColor={themeColors.accent}
-          />
-        ) : (
-          <View style={styles.emptyProgress}>
-            <View style={styles.emptyProgressBar} />
-            <View style={styles.emptyProgressTimes}>
-              <Text style={styles.emptyProgressTime}>0:00</Text>
-              <Text style={styles.emptyProgressTime}>--:--</Text>
+        {/* Progress bar (read-only) */}
+        <View style={{ marginTop: 20, marginBottom: 12 }}>
+          {guestTrackName ? (
+            <SeekBar
+              positionMs={guestPositionMs}
+              durationMs={guestDurationMs}
+              readOnly
+              accentColor={themeColors.accent}
+            />
+          ) : (
+            <View style={styles.emptyProgress}>
+              <View style={styles.emptyProgressBar} />
+              <View style={styles.emptyProgressTimes}>
+                <Text style={styles.emptyProgressTime}>0:00</Text>
+                <Text style={styles.emptyProgressTime}>--:--</Text>
+              </View>
             </View>
-          </View>
-        )}
+          )}
+        </View>
 
-        {/* Guest volume (only control guests have) */}
+        {/* Guest volume */}
         <VolumeSlider
           value={guestVolume}
           muted={guestMuted}
           onValueChange={setGuestVolume}
           onToggleMute={() => setGuestMuted(!guestMuted)}
-          label="Your Volume"
           accentColor={themeColors.accent}
         />
 
@@ -127,53 +109,27 @@ export default function GuestSessionScreen() {
       </SectionCard>
 
       {/* ── Session info ────────────────────────────────────────────────── */}
-      <SectionCard title="Session Info">
+      <SectionCard>
         <SessionCodeDisplay code={sessionCode} />
-
-        <View style={styles.sessionMeta}>
-          <View style={styles.metaItem}>
-            <Text style={styles.metaLabel}>Status</Text>
-            <StatusChip label="● Connected" tone="blue" />
-          </View>
-          <View style={styles.metaItem}>
-            <Text style={styles.metaLabel}>Clock offset</Text>
-            <Text style={styles.metaValue}>{clockOffsetMs.toFixed(0)} ms</Text>
-          </View>
-        </View>
-
-        {/* Stream info cards */}
-        <View style={styles.infoGrid}>
-          <View style={styles.infoCard}>
-            <Text style={styles.infoCardLabel}>Stream</Text>
-            <Text style={[styles.infoCardValue, { color: guestStreamReady ? themeColors.success : themeColors.warning }]}>
-              {guestStreamReady ? 'READY' : 'BUFFERING'}
-            </Text>
-          </View>
-          <View style={styles.infoCard}>
-            <Text style={styles.infoCardLabel}>Sync</Text>
-            <Text style={[styles.infoCardValue, { color: guestSyncReady ? themeColors.success : themeColors.warning }]}>
-              {guestSyncReady ? 'SYNCED' : 'PENDING'}
-            </Text>
-          </View>
-          <View style={styles.infoCard}>
-            <Text style={styles.infoCardLabel}>Offset</Text>
-            <Text style={styles.infoCardValue}>{clockOffsetMs.toFixed(0)}ms</Text>
-          </View>
+        <View style={{ marginTop: 12 }}>
+          <Text style={{ color: themeColors.textSecondary, fontSize: 13, textAlign: 'center', fontWeight: '600' }}>
+            Connected to Host • Offset: {clockOffsetMs.toFixed(0)}ms
+          </Text>
         </View>
       </SectionCard>
 
       {/* ── Guest tips ──────────────────────────────────────────────────── */}
       <SectionCard title="Tips">
         <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 8, marginBottom: 8 }}>
-          <Feather name="headphones" size={14} color="rgba(213,226,244,0.7)" style={{ marginTop: 2 }} />
+          <Feather name="headphones" size={14} color={themeColors.textMuted} style={{ marginTop: 2 }} />
           <Text style={[styles.tip, { flex: 1 }]}>Playback is controlled by the host. You can only adjust your own volume.</Text>
         </View>
         <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 8, marginBottom: 8 }}>
-          <Feather name="music" size={14} color="rgba(213,226,244,0.7)" style={{ marginTop: 2 }} />
+          <Feather name="music" size={14} color={themeColors.textMuted} style={{ marginTop: 2 }} />
           <Text style={[styles.tip, { flex: 1 }]}>Use the Queue tab to suggest songs to the host.</Text>
         </View>
         <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 8 }}>
-          <Feather name="radio" size={14} color="rgba(213,226,244,0.7)" style={{ marginTop: 2 }} />
+          <Feather name="radio" size={14} color={themeColors.textMuted} style={{ marginTop: 2 }} />
           <Text style={[styles.tip, { flex: 1 }]}>Stay on the same Wi-Fi network as the host for best sync quality.</Text>
         </View>
       </SectionCard>
@@ -207,25 +163,17 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
     flexWrap: 'wrap',
   },
 
-  // Disconnect button
-  disconnectBtn: {
-    backgroundColor: theme.dangerDim,
-    borderRadius: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderWidth: 1,
-    borderColor: theme.dangerDim,
-  },
-  disconnectText: {
-    color: theme.danger,
-    fontSize: 13,
-    fontWeight: '700',
+
+  iconBtn: {
+    padding: 8,
+    borderRadius: 20,
+    backgroundColor: theme.cardBorder,
   },
 
   // Track artwork + info
   trackInfo: {
     flexDirection: 'row',
-    alignItems: 'center',
+    alignItems: 'flex-start',
     gap: 14,
   },
   artwork: {
@@ -296,54 +244,7 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
   },
   errorText: { color: theme.danger, fontSize: 13 },
 
-  // Session meta
-  sessionMeta: {
-    gap: 10,
-  },
-  metaItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  metaLabel: {
-    color: theme.textSecondary,
-    fontSize: 13,
-  },
-  metaValue: {
-    color: theme.textPrimary,
-    fontSize: 13,
-    fontFamily: 'monospace',
-    fontWeight: '700',
-  },
 
-  // Info grid
-  infoGrid: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  infoCard: {
-    flex: 1,
-    backgroundColor: theme.card,
-    borderRadius: 14,
-    padding: 12,
-    gap: 4,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: theme.cardBorder,
-  },
-  infoCardLabel: {
-    color: theme.textMuted,
-    fontSize: 10,
-    fontWeight: '700',
-    textTransform: 'uppercase',
-    letterSpacing: 0.8,
-  },
-  infoCardValue: {
-    color: theme.textPrimary,
-    fontSize: 13,
-    fontWeight: '800',
-    fontFamily: 'monospace',
-  },
 
   // Tips
   tip: {

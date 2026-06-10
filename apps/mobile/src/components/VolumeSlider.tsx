@@ -53,7 +53,7 @@ export default function VolumeSlider({
             step={0.01}
             value={displayValue}
             minimumTrackTintColor={activeAccent}
-            maximumTrackTintColor={themeColors.cardBorder}
+            maximumTrackTintColor={themeColors.border}
             thumbTintColor={themeColors.textPrimary}
             onValueChange={(v) => {
               onValueChange(v)

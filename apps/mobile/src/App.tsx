@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Appearance,
   StyleSheet,
@@ -12,6 +12,7 @@ import { StatusBar as ExpoStatusBar } from 'expo-status-bar'
 import { useKeepAwake } from 'expo-keep-awake'
 
 import { useSessionStore } from './store/sessionStore'
+import { clockSync } from './services/clockSync'
 import type { TabId } from './types/session'
 
 import BottomTabBar from './components/BottomTabBar'
@@ -69,6 +70,74 @@ function MainApp() {
   const styles = useMemo(() => createStyles(themeColors), [themeColors])
 
   const [activeTab, setActiveTab] = useState<TabId>('player')
+  const pendingPlayRef = useRef<Record<string, unknown> | null>(null)
+  const pendingReadyRef = useRef<{ trackId: string; positionMs: number } | null>(null)
+  const guestCommandTimersRef = useRef<ReturnType<typeof setTimeout>[]>([])
+  const guestStreamLoadedRef = useRef(false)
+  const guestLoadingTrackRef = useRef<string | null>(null)
+  const readyAckInFlightRef = useRef(false)
+
+  const clearGuestCommandTimers = () => {
+    guestCommandTimersRef.current.forEach(clearTimeout)
+    guestCommandTimersRef.current = []
+  }
+
+  const scheduleGuestCommand = (callback: () => void, delay: number) => {
+    const timer = setTimeout(() => {
+      guestCommandTimersRef.current = guestCommandTimersRef.current.filter((item) => item !== timer)
+      callback()
+    }, Math.max(0, delay))
+    guestCommandTimersRef.current.push(timer)
+  }
+
+  const maybeApplyPendingPlay = () => {
+    const msg = pendingPlayRef.current
+    if (!msg || !guestStreamLoadedRef.current || !clockSync.isSynced()) return
+
+    pendingPlayRef.current = null
+    const positionMs = Number(msg.positionMs ?? 0)
+    const playAt = Number(msg.playAt ?? Date.now())
+    const delay = Math.max(0, clockSync.toLocalTime(playAt) - Date.now())
+
+    useSessionStore.setState({ guestPositionMs: positionMs })
+    const seekStartedAt = Date.now()
+    void audioService.seek(positionMs)
+      .catch((err) => pushLog(`Play seek failed: ${err.message}`))
+      .finally(() => {
+        const remainingDelay = Math.max(0, delay - (Date.now() - seekStartedAt))
+        scheduleGuestCommand(() => {
+          void audioService.play()
+          useSessionStore.setState({ hostPlaying: true })
+        }, remainingDelay)
+      })
+  }
+
+  const maybeSendReadyAck = () => {
+    const pending = pendingReadyRef.current
+    if (!pending || !guestStreamLoadedRef.current || !clockSync.isSynced()) return
+    if (readyAckInFlightRef.current) return
+
+    readyAckInFlightRef.current = true
+    void audioService.seek(pending.positionMs)
+      .then(() => {
+        if (pendingReadyRef.current !== pending) return
+        pendingReadyRef.current = null
+        socketClient.sendToHost({
+          type: 'READY_ACK',
+          trackId: pending.trackId,
+          positionMs: pending.positionMs,
+        })
+        useSessionStore.setState({ guestPositionMs: pending.positionMs, guestStreamReady: true, guestSyncReady: true })
+        pushLog('→ READY_ACK')
+        maybeApplyPendingPlay()
+      })
+      .catch((err) => {
+        pushLog(`Ready seek failed: ${err.message}`)
+      })
+      .finally(() => {
+        readyAckInFlightRef.current = false
+      })
+  }
 
   // Keep screen awake during live sessions
   useKeepAwake(isSessionLive ? 'session-active' : undefined as unknown as string)
@@ -135,22 +204,38 @@ function MainApp() {
       return
     }
 
-    const { udpEnabled, broadcastPortInput, hostAddress } = useSessionStore.getState()
+    const { udpEnabled, hostPortInput, hostAddress } = useSessionStore.getState()
 
     if (!udpEnabled) return
 
-    const port = Number(broadcastPortInput) || 7400
+    const port = Number(hostPortInput) || 7400
 
     udpDiscovery.startListening(
       port,
       (session) => {
+        const isNew = !useSessionStore.getState().discoveredSessions.some(
+          (s) => s.sessionCode === session.sessionCode
+        )
         addDiscoveredSession(session)
-        pushLog(`Found host: ${session.sessionCode} @ ${session.hostAddress}`)
+        if (isNew) {
+          pushLog(`Found host: ${session.sessionCode} @ ${session.hostAddress}`)
+        }
       },
       hostAddress,
     )
 
+    // Ping host every 3s if we connect, but since we are handling connection below, 
+    // we'll do the ping interval in a separate useEffect
     return () => udpDiscovery.stopListening()
+  }, [isGuestConnected])
+
+  useEffect(() => {
+    if (isGuestConnected) {
+      const sendPing = () => socketClient.sendToHost({ type: 'SYNC_PING', t0: Date.now() })
+      sendPing()
+      const interval = setInterval(sendPing, 3000)
+      return () => clearInterval(interval)
+    }
   }, [isGuestConnected, addDiscoveredSession, pushLog])
 
   // ── Socket client message handler (guest incoming messages) ───────────────
@@ -159,7 +244,9 @@ function MainApp() {
 
     const handleMessage = (msg: Record<string, unknown>) => {
       const type = msg.type as string
-      pushLog(`← ${type}`)
+      if (type !== 'SYNC_PONG') {
+        pushLog(`← ${type}`)
+      }
 
       switch (type) {
         case 'WELCOME':
@@ -170,19 +257,41 @@ function MainApp() {
         case 'CMD_PLAY': {
           const positionMs = Number(msg.positionMs ?? 0)
           const playAt = Number(msg.playAt ?? Date.now())
-          const delay = Math.max(0, playAt - Date.now())
+          const localPlayAt = clockSync.toLocalTime(playAt)
+          const delay = Math.max(0, localPlayAt - Date.now())
+
+          if (!guestStreamLoadedRef.current || !clockSync.isSynced()) {
+            pendingPlayRef.current = msg
+            pushLog('CMD_PLAY queued until stream and sync are ready')
+            return
+          }
+          
+          // Only seek if we are out of sync by more than 1.5 seconds, or if starting from the beginning
+          const currentPos = useSessionStore.getState().guestPositionMs
           useSessionStore.setState({ guestPositionMs: positionMs })
-          setTimeout(() => {
-            void audioService.play()
-            useSessionStore.setState({ hostPlaying: true })
-          }, delay)
+
+          clearGuestCommandTimers()
+          const needsSeek = Math.abs(currentPos - positionMs) > 1500 || positionMs < 100
+          const seekStartedAt = Date.now()
+          const readyToSchedule = needsSeek
+            ? audioService.seek(positionMs).catch((err) => pushLog(`Play seek failed: ${err.message}`))
+            : Promise.resolve()
+          void readyToSchedule.finally(() => {
+            const remainingDelay = Math.max(0, delay - (Date.now() - seekStartedAt))
+            scheduleGuestCommand(() => {
+              void audioService.play()
+              useSessionStore.setState({ hostPlaying: true })
+            }, remainingDelay)
+          })
           break
         }
 
         case 'CMD_PAUSE': {
           const pauseAt = Number(msg.pauseAt ?? Date.now())
-          const delay = Math.max(0, pauseAt - Date.now())
-          setTimeout(() => {
+          const localPauseAt = clockSync.toLocalTime(pauseAt)
+          const delay = Math.max(0, localPauseAt - Date.now())
+          clearGuestCommandTimers()
+          scheduleGuestCommand(() => {
             void audioService.pause()
             useSessionStore.setState({ hostPlaying: false })
           }, delay)
@@ -196,14 +305,50 @@ function MainApp() {
           break
         }
 
-        case 'SYNC_PING': {
-          // Reply with pong so host can calculate our clock offset
+        case 'SYNC_PONG': {
+          const t3 = Date.now()
           const t0 = Number(msg.t0 ?? 0)
-          socketClient.sendToHost({ type: 'SYNC_PONG', t0, t1: Date.now() })
+          const t1 = Number(msg.t1 ?? 0)
+          const t2 = Number(msg.t2 ?? 0)
+          const offset = ((t1 - t0) + (t2 - t3)) / 2
+          clockSync.applyOffset(offset)
+          useSessionStore.setState({
+            clockOffsetMs: offset,
+            guestSyncReady: true,
+          })
+          maybeSendReadyAck()
+          maybeApplyPendingPlay()
           break
         }
 
-        case 'STREAM_INIT':
+        case 'READY_REQUEST': {
+          const positionMs = Number(msg.positionMs ?? 0)
+          const trackId = String(msg.trackId ?? 'unknown')
+          pushLog(`← READY_REQUEST at ${positionMs}ms`)
+          pendingReadyRef.current = { trackId, positionMs }
+          useSessionStore.setState({ guestStreamReady: false })
+          socketClient.sendToHost({ type: 'SYNC_PING', t0: Date.now() })
+
+          if (!guestStreamLoadedRef.current) break
+
+          maybeSendReadyAck()
+          break
+        }
+
+        case 'STREAM_INIT': {
+          const hostIp = socketClient.getHost()
+          const hostPort = socketClient.getPort()
+          const mimeType = String(msg.mimeType || 'audio/mpeg')
+          const ext = mimeType === 'audio/wav' ? '.wav' : mimeType === 'audio/flac' ? '.flac' : mimeType === 'audio/aac' ? '.aac' : mimeType === 'audio/mp4' ? '.m4a' : mimeType === 'audio/ogg' ? '.ogg' : '.mp3'
+          const streamUrl = `http://${hostIp}:${hostPort}/stream${ext}?trackId=${msg.trackId}`
+          const trackId = String(msg.trackId ?? '')
+
+          clearGuestCommandTimers()
+          pendingPlayRef.current = null
+          pendingReadyRef.current = null
+          readyAckInFlightRef.current = false
+          guestStreamLoadedRef.current = false
+          guestLoadingTrackRef.current = trackId
           useSessionStore.setState({
             guestTrackName: String(msg.fileName ?? ''),
             guestStreamReady: false,
@@ -212,7 +357,27 @@ function MainApp() {
             guestDurationMs: 0,
           })
           pushLog(`Track: ${String(msg.fileName ?? '')}`)
+          
+          audioService.load(streamUrl, false, useSessionStore.getState().guestMuted ? 0 : useSessionStore.getState().guestVolume)
+            .then(({ durationMs }) => {
+              if (guestLoadingTrackRef.current !== trackId) return
+              guestStreamLoadedRef.current = true
+              useSessionStore.setState({ guestStreamReady: true })
+              if (durationMs > 0) useSessionStore.setState({ guestDurationMs: durationMs })
+              pushLog('Stream loaded')
+              maybeSendReadyAck()
+              maybeApplyPendingPlay()
+            })
+            .catch(err => {
+              if (guestLoadingTrackRef.current !== trackId) return
+              pushLog(`Stream load failed: ${err.message}`)
+              useSessionStore.setState({
+                guestError: `Stream load failed: ${err.message}`,
+                guestStreamReady: false,
+              })
+            })
           break
+        }
 
         default:
           break
@@ -221,6 +386,11 @@ function MainApp() {
 
     const handleDisconnect = () => {
       pushLog('Disconnected from host')
+      clearGuestCommandTimers()
+      pendingPlayRef.current = null
+      pendingReadyRef.current = null
+      readyAckInFlightRef.current = false
+      guestStreamLoadedRef.current = false
       void leaveSession()
     }
 
@@ -242,18 +412,35 @@ function MainApp() {
   // ── Audio service status listener ──────────────────────────────────────────
   useEffect(() => {
     audioService.onStatusUpdate((status) => {
+      const isGuest = useSessionStore.getState().guestConnected
       if (status.isLoaded) {
-        _setHostPosition(status.positionMs)
-        _setHostDuration(status.durationMs)
-        _setHostPlaying(status.isPlaying)
-        if (status.didJustFinish) {
-          void nextTrack()
+        if (isGuest) {
+          useSessionStore.setState({
+            guestPositionMs: status.positionMs,
+            guestDurationMs: status.durationMs,
+            guestStreamReady: status.isLoaded && !status.isBuffering,
+          })
+        } else {
+          _setHostPosition(status.positionMs)
+          _setHostDuration(status.durationMs)
+          _setHostPlaying(status.isPlaying)
+          if (status.didJustFinish) {
+            void nextTrack()
+          }
         }
       } else {
-        _setHostPlaying(false)
+        if (!isGuest) {
+          _setHostPlaying(false)
+        }
       }
     })
   }, [_setHostPosition, _setHostDuration, _setHostPlaying, nextTrack])
+
+  useEffect(() => {
+    return () => {
+      clearGuestCommandTimers()
+    }
+  }, [])
 
   // ── Route the player tab ───────────────────────────────────────────────────
   const renderPlayerTab = () => {

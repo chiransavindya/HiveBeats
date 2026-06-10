@@ -57,9 +57,9 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
   codeWrap: {
     flex: 1,
     borderRadius: 20,
-    backgroundColor: theme.card,
+    backgroundColor: theme.surfaceSubtle,
     borderWidth: 1,
-    borderColor: theme.primaryDim,
+    borderColor: theme.cardBorder,
     paddingVertical: 20,
     paddingHorizontal: 16,
     alignItems: 'center',
@@ -80,9 +80,9 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
   },
   qrWrap: {
     padding: 10,
-    borderRadius: 16,
-    backgroundColor: theme.cardBorder,
+    borderRadius: 20,
+    backgroundColor: 'transparent',
     borderWidth: 1,
-    borderColor: theme.border,
+    borderColor: theme.cardBorder,
   },
 })

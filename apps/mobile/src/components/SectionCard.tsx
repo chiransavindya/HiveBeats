@@ -7,7 +7,7 @@ import type { AppThemeColors } from '../theme/theme'
 import { LinearGradient } from 'expo-linear-gradient'
 
 type Props = {
-  title: string
+  title?: string
   subtitle?: string
   rightSlot?: ReactNode
   children: ReactNode
@@ -27,13 +27,15 @@ export default function SectionCard({ title, subtitle, rightSlot, children }: Pr
           style={StyleSheet.absoluteFillObject}
         />
         <View style={styles.content}>
-          <View style={styles.header}>
-            <View style={styles.headerText}>
-              <Text style={styles.title}>{title}</Text>
-              {subtitle ? <Text style={styles.subtitle}>{subtitle}</Text> : null}
+          {title || subtitle || rightSlot ? (
+            <View style={styles.header}>
+              <View style={styles.headerText}>
+                {title ? <Text style={styles.title}>{title}</Text> : null}
+                {subtitle ? <Text style={styles.subtitle}>{subtitle}</Text> : null}
+              </View>
+              {rightSlot ? <View>{rightSlot}</View> : null}
             </View>
-            {rightSlot ? <View>{rightSlot}</View> : null}
-          </View>
+          ) : null}
           <View style={styles.body}>{children}</View>
         </View>
       </BlurView>

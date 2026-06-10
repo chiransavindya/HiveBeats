@@ -105,28 +105,23 @@ export default function HostSessionScreen() {
       <AppHeader showStatus />
 
       {/* ── Session info ──────────────────────────────────────────────── */}
-      <SectionCard
-        title="Your Session"
-        subtitle={`${guestCount} guest${guestCount !== 1 ? 's' : ''} connected`}
-        rightSlot={
-          <TouchableOpacity
-            style={styles.stopBtn}
-            onPress={() => setShowStopModal(true)}
-          >
-            <Text style={styles.stopBtnText}>Stop</Text>
-          </TouchableOpacity>
-        }
-      >
-        <View style={styles.codeRow}>
-          <SessionCodeDisplay code={sessionCode} />
-          <TouchableOpacity onPress={regenerateCode} style={styles.regenBtn}>
-            <Feather name="refresh-cw" size={18} color={themeColors.textPrimary} />
+      <SectionCard>
+        <View style={styles.sessionHeader}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+            <Text style={styles.sessionTitle}>Session</Text>
+            <StatusChip label="LIVE" tone="live" />
+            <StatusChip label={`${guestCount} connected`} tone="blue" />
+          </View>
+          <TouchableOpacity onPress={() => setShowStopModal(true)} style={styles.iconBtn}>
+            <Feather name="power" size={16} color={themeColors.danger} />
           </TouchableOpacity>
         </View>
 
+        <View style={{ marginBottom: 16 }}>
+          <SessionCodeDisplay code={sessionCode} />
+        </View>
+
         <View style={styles.statusRow}>
-          <StatusChip label="● LIVE" tone="live" />
-          <StatusChip label={`Clock: ${clockOffsetMs.toFixed(0)}ms`} tone="neutral" />
           <View style={styles.queueToggle}>
             <Text style={styles.toggleLabel}>Allow Requests</Text>
             <Switch
@@ -136,6 +131,11 @@ export default function HostSessionScreen() {
               thumbColor={queueRequestsAllowed ? themeColors.primary : '#aaa'}
             />
           </View>
+          
+          <TouchableOpacity onPress={regenerateCode} style={styles.regenBtnText}>
+            <Feather name="refresh-cw" size={14} color={themeColors.textSecondary} />
+            <Text style={styles.regenTxt}>Regen Code</Text>
+          </TouchableOpacity>
         </View>
 
         {hostError && (
@@ -178,7 +178,14 @@ export default function HostSessionScreen() {
       )}
 
       {/* ── Now Playing ────────────────────────────────────────────────── */}
-      <SectionCard title="Now Playing">
+      <SectionCard 
+        title="Now Playing"
+        rightSlot={
+          <TouchableOpacity onPress={() => void handlePickAudio()}>
+            <Feather name="plus-circle" size={20} color={themeColors.secondary} />
+          </TouchableOpacity>
+        }
+      >
         {/* Track info */}
         <View style={styles.trackInfo}>
           <View style={[styles.artwork, hostPlaying && styles.artworkPlaying]}>
@@ -200,7 +207,7 @@ export default function HostSessionScreen() {
         </View>
 
         {/* Waveform visualizer */}
-        <WaveformBars isPlaying={hostPlaying} height={56} />
+        <WaveformBars isPlaying={hostPlaying} height={40} />
 
         {/* Seek bar */}
         <SeekBar
@@ -234,7 +241,7 @@ export default function HostSessionScreen() {
             onPress={() => void prevTrack()}
             disabled={currentQueueIndex <= 0}
           >
-            <Feather name="skip-back" size={18} color="#f7fbff" />
+            <Feather name="skip-back" size={20} color={currentQueueIndex > 0 ? themeColors.textPrimary : themeColors.textMuted} />
           </TouchableOpacity>
 
           <TouchableOpacity
@@ -242,7 +249,7 @@ export default function HostSessionScreen() {
             onPress={() => void seekHost(Math.max(0, hostPositionMs - 10000))}
             disabled={!selectedTrack}
           >
-            <Feather name="rewind" size={18} color="#f7fbff" />
+            <Feather name="rewind" size={20} color={selectedTrack ? themeColors.textPrimary : themeColors.textMuted} />
           </TouchableOpacity>
 
           {hostPlaying ? (
@@ -267,7 +274,7 @@ export default function HostSessionScreen() {
             onPress={() => void seekHost(Math.min(hostDurationMs, hostPositionMs + 10000))}
             disabled={!selectedTrack}
           >
-            <Feather name="fast-forward" size={18} color="#f7fbff" />
+            <Feather name="fast-forward" size={20} color={selectedTrack ? themeColors.textPrimary : themeColors.textMuted} />
           </TouchableOpacity>
 
           <TouchableOpacity
@@ -275,7 +282,7 @@ export default function HostSessionScreen() {
             onPress={() => void nextTrack()}
             disabled={currentQueueIndex >= queue.length - 1}
           >
-            <Feather name="skip-forward" size={18} color="#f7fbff" />
+            <Feather name="skip-forward" size={20} color={currentQueueIndex < queue.length - 1 ? themeColors.textPrimary : themeColors.textMuted} />
           </TouchableOpacity>
         </View>
 
@@ -288,26 +295,6 @@ export default function HostSessionScreen() {
           label="Volume"
           accentColor="#ff6b35"
         />
-
-        {/* Actions row */}
-        <View style={styles.actionsRow}>
-          <TouchableOpacity style={styles.addTrackBtn} onPress={() => void handlePickAudio()}>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-              <Feather name="plus" size={14} color="#7db3ff" />
-              <Text style={styles.addTrackText}>Add Track</Text>
-            </View>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.stopTrackBtn, !selectedTrack && styles.stopTrackBtnDisabled]}
-            onPress={() => void stopHost2()}
-            disabled={!selectedTrack}
-          >
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-              <Feather name="square" size={14} color="#f87171" />
-              <Text style={styles.stopTrackText}>Stop</Text>
-            </View>
-          </TouchableOpacity>
-        </View>
 
         {/* Status line */}
         <View style={styles.statusLine}>
@@ -353,62 +340,54 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
     gap: 4,
   },
 
-  // Code row
-  codeRow: {
+  // Session Header
+  sessionHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    justifyContent: 'space-between',
+    marginBottom: 16,
   },
-  regenBtn: {
-    width: 40,
-    height: 40,
+  sessionTitle: {
+    color: theme.textPrimary,
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  iconBtn: {
+    padding: 8,
     borderRadius: 20,
     backgroundColor: theme.cardBorder,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: theme.border,
-  },
-  regenText: {
-    color: theme.textPrimary,
-    fontSize: 18,
   },
 
-  // Status
+  // Status & Bottom row
   statusRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    flexWrap: 'wrap',
-    gap: 8,
+    justifyContent: 'space-between',
   },
   queueToggle: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    marginLeft: 'auto',
   },
   toggleLabel: {
+    color: theme.textSecondary,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  regenBtnText: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    backgroundColor: theme.cardBorder,
+  },
+  regenTxt: {
     color: theme.textSecondary,
     fontSize: 12,
     fontWeight: '600',
   },
-
-  // Stop btn
-  stopBtn: {
-    backgroundColor: theme.dangerDim,
-    borderRadius: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderWidth: 1,
-    borderColor: theme.dangerDim,
-  },
-  stopBtnText: {
-    color: theme.danger,
-    fontSize: 13,
-    fontWeight: '700',
-  },
-
-  // Error
   errorBox: {
     backgroundColor: theme.dangerDim,
     borderRadius: 12,
@@ -519,12 +498,10 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
     gap: 6,
   },
   speedPill: {
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 99,
-    backgroundColor: theme.cardBorder,
-    borderWidth: 1,
-    borderColor: theme.border,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: 'transparent',
   },
   speedPillActive: {
     backgroundColor: theme.primaryDim,
@@ -549,8 +526,6 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
   ctrlBtn: {
     width: 44,
     height: 44,
-    borderRadius: 22,
-    backgroundColor: theme.cardBorder,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -572,40 +547,7 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
   playBtnDisabled: { opacity: 0.4 },
   playBtnIcon: { fontSize: 22, color: '#fff' },
 
-  // Actions row
-  actionsRow: {
-    flexDirection: 'row',
-    gap: 10,
-  },
-  addTrackBtn: {
-    flex: 1,
-    backgroundColor: theme.secondaryDim,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: theme.secondaryDim,
-    paddingVertical: 12,
-    alignItems: 'center',
-  },
-  addTrackText: {
-    color: theme.secondary,
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  stopTrackBtn: {
-    backgroundColor: theme.dangerDim,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: theme.dangerDim,
-    paddingVertical: 12,
-    paddingHorizontal: 18,
-    alignItems: 'center',
-  },
-  stopTrackBtnDisabled: { opacity: 0.35 },
-  stopTrackText: {
-    color: theme.danger,
-    fontSize: 14,
-    fontWeight: '700',
-  },
+
 
   // Status line
   statusLine: {

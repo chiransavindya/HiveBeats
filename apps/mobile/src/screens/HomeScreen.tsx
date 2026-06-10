@@ -17,6 +17,7 @@ import SessionCodeDisplay from '../components/SessionCodeDisplay'
 import StatusChip from '../components/StatusChip'
 import SectionCard from '../components/SectionCard'
 import AppHeader from '../components/AppHeader'
+import { QRScanner } from '../components/QRScanner'
 import { LinearGradient } from 'expo-linear-gradient'
 import { useAppTheme } from '../hooks/useAppTheme'
 import type { AppThemeColors } from '../theme/theme'
@@ -44,6 +45,8 @@ export default function HomeScreen() {
   const [joinCode, setJoinCode] = useState('')
   const [isStarting, setIsStarting] = useState(false)
   const [isJoining, setIsJoining] = useState(false)
+  const [showQRScanner, setShowQRScanner] = useState(false)
+  const [showHostQR, setShowHostQR] = useState(false)
 
   const handleStartHost = useCallback(async () => {
     setIsStarting(true)
@@ -54,18 +57,35 @@ export default function HomeScreen() {
     }
   }, [startHost])
 
-  const handleJoin = useCallback(async () => {
-    if (!joinHost.trim()) {
+  const handleJoin = useCallback(async (hostOverride?: string, codeOverride?: string) => {
+    const ip = (hostOverride ?? joinHost).trim()
+    const code = (codeOverride ?? joinCode).trim() || sessionCode
+
+    if (!ip) {
       Alert.alert('Enter Host IP', 'Please enter the host device IP address to connect.')
       return
     }
     setIsJoining(true)
     try {
-      await joinSession(joinCode.trim() || sessionCode, joinHost.trim())
+      await joinSession(code, ip)
     } finally {
       setIsJoining(false)
     }
   }, [joinHost, joinCode, sessionCode, joinSession])
+
+  if (showQRScanner) {
+    return (
+      <QRScanner 
+        onScan={(ip, port, code) => {
+          setShowQRScanner(false)
+          setJoinHost(ip)
+          setJoinCode(code)
+          joinSession(code, ip).catch(() => {})
+        }}
+        onCancel={() => setShowQRScanner(false)} 
+      />
+    )
+  }
 
   return (
     <KeyboardAvoidingView
@@ -81,63 +101,51 @@ export default function HomeScreen() {
         <AppHeader showStatus />
 
         {/* ── Host Section ───────────────────────────────────────────────── */}
-        <SectionCard
-          title="Your Session"
-          subtitle={`Device: ${deviceAlias}`}
-          rightSlot={
-            <TouchableOpacity onPress={regenerateCode} style={styles.newCodeBtn}>
-              <Text style={styles.newCodeText}>New Code</Text>
-            </TouchableOpacity>
-          }
-        >
-          <SessionCodeDisplay code={sessionCode} showQR />
-
-          {connected && (
-            <View style={styles.ipRow}>
-              <Text style={styles.ipLabel}>Your IP:</Text>
-              <Text style={styles.ipValue}>{hostAddress}</Text>
-              <StatusChip label={`Port ${hostPortInput}`} tone="neutral" />
+        <SectionCard>
+          <View style={styles.sessionHeader}>
+            <View style={{ gap: 4 }}>
+              <Text style={styles.sessionTitle}>Host a Session</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                <Text style={styles.sessionSubtitle}>{deviceAlias}</Text>
+                {connected && (
+                  <>
+                    <View style={{ width: 4, height: 4, borderRadius: 2, backgroundColor: themeColors.border }} />
+                    <Text style={[styles.sessionSubtitle, { fontFamily: 'monospace' }]}>{hostAddress}:{hostPortInput}</Text>
+                  </>
+                )}
+              </View>
             </View>
-          )}
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              <TouchableOpacity onPress={() => setShowHostQR(!showHostQR)} style={styles.iconBtn}>
+                <Feather name="maximize" size={16} color={showHostQR ? themeColors.primary : themeColors.textSecondary} />
+              </TouchableOpacity>
+              <TouchableOpacity onPress={regenerateCode} style={styles.iconBtn}>
+                <Feather name="refresh-cw" size={16} color={themeColors.textSecondary} />
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          <View style={{ marginBottom: 4 }}>
+            <SessionCodeDisplay code={sessionCode} showQR={showHostQR} />
+          </View>
 
           {hostError && (
-            <View style={[styles.errorBox, { flexDirection: 'row', alignItems: 'center' }]}>
+            <View style={[styles.errorBox, { flexDirection: 'row', alignItems: 'center', marginTop: 12 }]}>
               <Feather name="alert-triangle" size={14} color={themeColors.danger} style={{ marginRight: 6 }} />
               <Text style={styles.errorText}>{hostError}</Text>
             </View>
           )}
 
-          <TouchableOpacity
-            style={[styles.heroBtnContainer, isStarting && styles.heroBtnDisabled]}
-            onPress={() => void handleStartHost()}
-            disabled={isStarting}
-            activeOpacity={0.85}
-          >
-            <LinearGradient
-              colors={[themeColors.gradientStart, themeColors.gradientEnd]}
-              style={styles.heroBtnGradient}
-              start={{ x: 0, y: 0 }}
-              end={{ x: 1, y: 1 }}
-            >
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                {isStarting ? (
-                  <ActivityIndicator color="#fff" size="small" />
-                ) : (
-                  <Feather name="mic" size={18} color="#fff" />
-                )}
-                <Text style={styles.heroBtnText}>
-                  {isStarting ? 'Starting…' : 'Start Hosting'}
-                </Text>
-              </View>
-            </LinearGradient>
-          </TouchableOpacity>
+          <View style={styles.infoBox}>
+            <Feather name="info" size={14} color={themeColors.textSecondary} style={{ marginRight: 8, marginTop: 2 }} />
+            <Text style={{ color: themeColors.textSecondary, fontSize: 13, flex: 1, lineHeight: 18 }}>
+              Hosting requires a native build. Please use your PC app to host, and join from here!
+            </Text>
+          </View>
         </SectionCard>
 
         {/* ── Join Section ───────────────────────────────────────────────── */}
         <SectionCard title="Join a Session">
-          <Text style={styles.hint}>
-            Enter the host's IP address to join their session on your local network.
-          </Text>
 
           <View style={styles.inputRow}>
             <TextInput
@@ -158,18 +166,13 @@ export default function HomeScreen() {
               disabled={!joinHost.trim() || isJoining}
               activeOpacity={0.85}
             >
-              <LinearGradient
-                colors={[themeColors.secondary, themeColors.accent]}
-                style={styles.joinBtnGradient}
-                start={{ x: 0, y: 0 }}
-                end={{ x: 1, y: 1 }}
-              >
+              <View style={[styles.joinBtnGradient, { backgroundColor: themeColors.primary }]}>
                 {isJoining ? (
                   <ActivityIndicator color="#fff" size="small" />
                 ) : (
                   <Text style={styles.joinBtnText}>Join</Text>
                 )}
-              </LinearGradient>
+              </View>
             </TouchableOpacity>
           </View>
 
@@ -183,6 +186,12 @@ export default function HomeScreen() {
             autoCapitalize="characters"
             maxLength={9}
           />
+
+          <TouchableOpacity style={{ paddingVertical: 10, alignItems: 'center' }} onPress={() => setShowQRScanner(true)}>
+            <Text style={{ color: themeColors.primary, fontWeight: 'bold' }}>
+              <Feather name="camera" size={16} /> Scan QR Code
+            </Text>
+          </TouchableOpacity>
 
           {/* Discovered sessions */}
           <View style={styles.discoverSection}>
@@ -210,7 +219,7 @@ export default function HomeScreen() {
                   onPress={() => {
                     setJoinHost(session.hostAddress)
                     setJoinCode(session.sessionCode)
-                    void handleJoin()
+                    void handleJoin(session.hostAddress, session.sessionCode)
                   }}
                   activeOpacity={0.8}
                 >
@@ -227,7 +236,7 @@ export default function HomeScreen() {
                     />
                     <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
                       <Text style={styles.connectText}>Connect</Text>
-                      <Feather name="arrow-right" size={14} color="#7db3ff" />
+                      <Feather name="arrow-right" size={14} color={themeColors.primary} />
                     </View>
                   </View>
                 </TouchableOpacity>
@@ -236,11 +245,7 @@ export default function HomeScreen() {
           </View>
         </SectionCard>
 
-        {/* ── Footer banner ──────────────────────────────────────────────── */}
-        <View style={styles.banner}>
-          <Text style={styles.bannerTitle}>Made by Bees of the Hive</Text>
-          <Text style={styles.bannerQuote}>"The hive mind is in the music. Listen together."</Text>
-        </View>
+
       </ScrollView>
     </KeyboardAvoidingView>
   )
@@ -256,23 +261,29 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
     gap: 4,
   },
 
-  // Code & IP row
-  ipRow: {
+  // Session Header
+  sessionHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    marginBottom: 16,
   },
-  ipLabel: {
-    color: theme.textSecondary,
-    fontSize: 12,
-  },
-  ipValue: {
+  sessionTitle: {
     color: theme.textPrimary,
-    fontSize: 12,
-    fontFamily: 'monospace',
+    fontSize: 16,
     fontWeight: '700',
   },
+  sessionSubtitle: {
+    color: theme.textSecondary,
+    fontSize: 13,
+  },
+  iconBtn: {
+    padding: 8,
+    borderRadius: 20,
+    backgroundColor: theme.cardBorder,
+  },
+
+
 
   // Error
   errorBox: {
@@ -285,6 +296,14 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
   errorText: {
     color: theme.danger,
     fontSize: 13,
+  },
+  infoBox: {
+    backgroundColor: theme.surfaceSubtle,
+    borderRadius: 12,
+    padding: 12,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginTop: 8,
   },
 
   // Hero button (Start Hosting)
@@ -311,20 +330,7 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
     letterSpacing: 0.3,
   },
 
-  // New Code button
-  newCodeBtn: {
-    backgroundColor: theme.cardBorder,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 7,
-    borderWidth: 1,
-    borderColor: theme.border,
-  },
-  newCodeText: {
-    color: theme.textPrimary,
-    fontSize: 12,
-    fontWeight: '700',
-  },
+
 
   // Join section
   hint: {
@@ -409,9 +415,9 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
   },
   discoveredCard: {
     borderRadius: 14,
-    backgroundColor: theme.secondaryDim,
+    backgroundColor: theme.surfaceSubtle,
     borderWidth: 1,
-    borderColor: theme.secondaryDim,
+    borderColor: theme.cardBorder,
     padding: 14,
     flexDirection: 'row',
     alignItems: 'center',
@@ -437,28 +443,10 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
     gap: 6,
   },
   connectText: {
-    color: theme.secondary,
+    color: theme.primary,
     fontSize: 13,
     fontWeight: '700',
   },
 
-  // Banner
-  banner: {
-    paddingTop: 16,
-    alignItems: 'flex-end',
-    gap: 3,
-  },
-  bannerTitle: {
-    color: theme.primary,
-    fontSize: 11,
-    fontWeight: '700',
-    textTransform: 'uppercase',
-    letterSpacing: 1.5,
-  },
-  bannerQuote: {
-    color: theme.textMuted,
-    fontSize: 12,
-    fontStyle: 'italic',
-    textAlign: 'right',
-  },
+
 })

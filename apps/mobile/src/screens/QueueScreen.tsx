@@ -411,7 +411,7 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
     paddingVertical: 14,
   },
   sendBtn: {
-    backgroundColor: theme.accent,
+    backgroundColor: theme.primary,
     borderRadius: 14,
     width: 52,
     alignItems: 'center',

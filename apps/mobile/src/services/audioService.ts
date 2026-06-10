@@ -24,6 +24,7 @@ import {
 export type AudioStatusCallback = (status: {
   isLoaded: boolean
   isPlaying: boolean
+  isBuffering: boolean
   positionMs: number
   durationMs: number
   didJustFinish: boolean
@@ -65,6 +66,7 @@ class AudioService {
     this.statusCallback({
       isLoaded: status.isLoaded,
       isPlaying: status.playing,
+      isBuffering: status.isBuffering,
       positionMs: Math.round((status.currentTime ?? 0) * 1000),
       durationMs: Math.round((status.duration ?? 0) * 1000),
       didJustFinish: !prevFinished && (status.didJustFinish ?? false),
@@ -79,24 +81,45 @@ class AudioService {
 
     this.player = createAudioPlayer(
       { uri },
-      { updateInterval: 0.3 }, // 300 ms status updates
+      {
+        preferredForwardBufferDuration: 5,
+        updateInterval: 500,
+      },
     )
 
     // Set initial volume
     this.player.volume = volume
 
-    // Subscribe to status updates
-    this.player.addListener('playbackStatusUpdate', this.handleStatus)
+    const player = this.player
 
-    if (shouldPlay) {
-      this.player.play()
-    }
+    return new Promise<{ durationMs: number }>((resolve, reject) => {
+      let settled = false
+      const settleLoaded = () => {
+        if (settled || this.player !== player) return
+        settled = true
+        if (shouldPlay) player.play()
+        resolve({ durationMs: Math.round((player.duration ?? 0) * 1000) })
+      }
+      const settleFailed = (message: string) => {
+        if (settled || this.player !== player) return
+        settled = true
+        reject(new Error(message))
+      }
 
-    // Give the player a moment to load duration
-    await new Promise<void>((resolve) => setTimeout(resolve, 200))
+      const timeout = setTimeout(() => {
+        settleFailed(`Timed out loading audio stream: ${uri}`)
+      }, 15000)
 
-    const durationMs = Math.round((this.player.duration ?? 0) * 1000)
-    return { durationMs }
+      // Subscribe to status updates. The listener is cleaned up by player.remove().
+      player.addListener('playbackStatusUpdate', (status) => {
+        this.handleStatus(status)
+
+        if (status.isLoaded) {
+          clearTimeout(timeout)
+          settleLoaded()
+        }
+      })
+    })
   }
 
   // ── Transport ─────────────────────────────────────────────────────────────

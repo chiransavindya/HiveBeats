@@ -118,10 +118,7 @@ const createStyles = (theme: AppThemeColors) => StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 3,
-    borderRadius: 12,
-    overflow: 'hidden',
-    backgroundColor: theme.cardBorder,
-    paddingHorizontal: 12,
+    backgroundColor: 'transparent',
   },
   bar: {
     flex: 1,

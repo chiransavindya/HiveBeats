@@ -43,7 +43,7 @@ export default function NetworkScreen() {
       <SectionCard title="Network Status">
         <View style={styles.statusRow}>
           <StatusChip
-            label={connected ? '● Connected' : '○ No Network'}
+            label={connected ? 'Connected' : 'No Network'}
             tone={connected ? 'good' : 'error'}
           />
           <Text style={styles.networkLabel}>{connectionLabel}</Text>

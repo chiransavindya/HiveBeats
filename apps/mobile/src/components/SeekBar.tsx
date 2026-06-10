@@ -23,8 +23,10 @@ export default function SeekBar({
   const styles = useMemo(() => createStyles(themeColors), [themeColors])
   const accentColor = themeColors.primary
 
-  const safeMax = Math.max(1, durationMs)
-  const progress = (positionMs / safeMax) * 100
+  const safePositionMs = isNaN(positionMs) ? 0 : positionMs
+  const safeDurationMs = isNaN(durationMs) ? 0 : durationMs
+  const safeMax = Math.max(1, safeDurationMs)
+  const progress = (safePositionMs / safeMax) * 100
 
   return (
     <View style={styles.container}>
@@ -34,9 +36,9 @@ export default function SeekBar({
         minimumValue={0}
         maximumValue={safeMax}
         step={500}
-        value={positionMs}
+        value={safePositionMs}
         minimumTrackTintColor={readOnly ? themeColors.accent : accentColor}
-        maximumTrackTintColor={themeColors.cardBorder}
+        maximumTrackTintColor={themeColors.border}
         thumbTintColor={readOnly ? 'transparent' : themeColors.textPrimary}
         disabled={readOnly || !onSeek}
         onSlidingComplete={(v) => {
@@ -46,8 +48,8 @@ export default function SeekBar({
 
       {/* Times */}
       <View style={styles.times}>
-        <Text style={styles.time}>{formatTime(positionMs)}</Text>
-        <Text style={styles.time}>{formatTime(durationMs)}</Text>
+        <Text style={styles.time}>{formatTime(safePositionMs)}</Text>
+        <Text style={styles.time}>{formatTime(safeDurationMs)}</Text>
       </View>
     </View>
   )

@@ -1,37 +1,17 @@
 /**
- * LAN Discovery service for HiveBeats mobile.
+ * LAN discovery service for HiveBeats mobile.
  *
- * The desktop host runs a WebSocket-over-HTTP server (port 7400 by default).
- * Expo Go / managed workflow has no access to raw UDP sockets, so we cannot
- * receive the desktop's UDP broadcast packets directly.
- *
- * Strategy — two complementary approaches, both using only APIs available in
- * Expo Go (fetch + WebSocket):
- *
- * 1. SUBNET SCAN (primary)
- *    Derive the /24 subnet from the device's own IP, then probe every host in
- *    that subnet by attempting a WebSocket upgrade to ws://x.x.x.N:<port>.
- *    A successful upgrade means a HiveBeats host is present. We read the first
- *    message (WELCOME / HELLO response) to get the session code.
- *    Concurrent batch size = 20 to avoid overwhelming the network stack.
- *
- * 2. WELL-KNOWN HOSTS (secondary)
- *    Common gateway addresses (.1, .254) are probed first for speed.
- *
- * The public API is kept identical to the original stub so no call-sites change.
- *
- * Note: "startBroadcasting" is kept as a no-op because the mobile uses
- * socketServer (WebSocket) for hosting, not UDP. The desktop's udp.ts handles
- * broadcast for desktop → desktop discovery; that path is unchanged.
+ * Expo Go cannot receive raw UDP broadcasts, so mobile discovery probes the
+ * local subnet with WebSocket handshakes against the desktop host port.
  */
 
 import type { DiscoveredSession } from '../types/session'
 
 type SessionFoundCallback = (session: DiscoveredSession) => void
 
-const PROBE_TIMEOUT_MS = 1200   // per-host WebSocket probe timeout
-const SCAN_BATCH_SIZE = 20      // concurrent probes at once
-const SCAN_INTERVAL_MS = 30000  // re-scan every 30 s while listening
+const PROBE_TIMEOUT_MS = 900
+const SCAN_BATCH_SIZE = 6
+const SCAN_INTERVAL_MS = 60000
 
 class UdpDiscovery {
   private broadcasting = false
@@ -41,8 +21,8 @@ class UdpDiscovery {
   private currentPort = 7400
   private currentSubnet = ''
   private scanAbortFlag = false
-
-  // ── Host: broadcast (no-op in Expo Go — desktop handles UDP broadcast) ───
+  private scanInProgress = false
+  private activeSockets = new Set<WebSocket>()
 
   startBroadcasting(_sessionCode: string, _port: number, _alias: string): void {
     this.broadcasting = true
@@ -53,8 +33,6 @@ class UdpDiscovery {
     this.broadcasting = false
   }
 
-  // ── Guest: discover hosts on LAN ─────────────────────────────────────────
-
   startListening(port: number, onFound: SessionFoundCallback, deviceIp?: string): void {
     if (this.listening) return
     this.listening = true
@@ -62,28 +40,24 @@ class UdpDiscovery {
     this.onSessionFound = onFound
     this.currentPort = port
 
-    // Derive subnet from device IP if provided
     if (deviceIp && deviceIp !== '0.0.0.0') {
       this.currentSubnet = this.deriveSubnet(deviceIp)
     }
 
     console.log(`[Discovery] Starting LAN scan on port ${port} (subnet: ${this.currentSubnet || 'unknown'})`)
 
-    // Run first scan immediately, then on interval
     void this.runScan()
     this.scanTimer = setInterval(() => {
       void this.runScan()
     }, SCAN_INTERVAL_MS)
   }
 
-  /** Call this whenever NetInfo gives us a new IP so the subnet stays current */
   updateDeviceIp(ip: string): void {
     if (!ip || ip === '0.0.0.0') return
     const subnet = this.deriveSubnet(ip)
     if (subnet !== this.currentSubnet) {
       this.currentSubnet = subnet
       console.log(`[Discovery] Subnet updated to ${subnet}.0/24`)
-      // Re-scan with new subnet if we're actively listening
       if (this.listening) {
         this.scanAbortFlag = true
         setTimeout(() => {
@@ -98,6 +72,10 @@ class UdpDiscovery {
     this.listening = false
     this.scanAbortFlag = true
     this.onSessionFound = null
+    for (const socket of this.activeSockets) {
+      try { socket.close() } catch { /* ignore */ }
+    }
+    this.activeSockets.clear()
     if (this.scanTimer) {
       clearInterval(this.scanTimer)
       this.scanTimer = null
@@ -105,45 +83,41 @@ class UdpDiscovery {
     console.log('[Discovery] Stopped scanning')
   }
 
-  // ── Probe a single host ───────────────────────────────────────────────────
-
-  /**
-   * Probe one IP address by attempting a WebSocket upgrade.
-   * Returns a DiscoveredSession if a HiveBeats host answered, null otherwise.
-   *
-   * The desktop's HTTP server (socket.ts) responds to the WS upgrade request;
-   * on successful open we immediately close (we only need to detect presence),
-   * but if it sends us a WELCOME message we can capture the session code.
-   */
   private async probeHost(ip: string, port: number): Promise<DiscoveredSession | null> {
     return new Promise<DiscoveredSession | null>((resolve) => {
       let settled = false
+      let ws: WebSocket | null = null
+
       const done = (result: DiscoveredSession | null) => {
         if (settled) return
         settled = true
+        if (ws) this.activeSockets.delete(ws)
         resolve(result)
       }
 
-      const url = `ws://${ip}:${port}`
-      let ws: WebSocket | null = null
+      const closeProbeSocket = () => {
+        if (ws) this.activeSockets.delete(ws)
+        try { ws?.close() } catch { /* ignore */ }
+      }
 
       const timer = setTimeout(() => {
-        try { ws?.close() } catch { /* ignore */ }
+        closeProbeSocket()
         done(null)
       }, PROBE_TIMEOUT_MS)
 
       try {
-        ws = new WebSocket(url)
+        ws = new WebSocket(`ws://${ip}:${port}`)
+        this.activeSockets.add(ws)
 
         let didOpen = false
 
         ws.onopen = () => {
           didOpen = true
-          // Connection succeeded → HiveBeats host present.
-          // Wait briefly for a WELCOME message to get the session code.
-          setTimeout(() => {
-            try { ws?.close() } catch { /* ignore */ }
-          }, 600)
+          try {
+            ws?.send(JSON.stringify({ type: 'HELLO', alias: 'Scanner', deviceId: 'scanner' }))
+          } catch { /* ignore */ }
+
+          setTimeout(closeProbeSocket, 500)
         }
 
         ws.onmessage = (event) => {
@@ -167,7 +141,7 @@ class UdpDiscovery {
               discoveredAt: Date.now(),
             })
           }
-          try { ws?.close() } catch { /* ignore */ }
+          closeProbeSocket()
         }
 
         ws.onclose = () => {
@@ -187,63 +161,73 @@ class UdpDiscovery {
 
         ws.onerror = () => {
           clearTimeout(timer)
-          try { ws?.close() } catch { /* ignore */ }
+          closeProbeSocket()
           done(null)
         }
       } catch {
         clearTimeout(timer)
+        closeProbeSocket()
         done(null)
       }
     })
   }
 
-  // ── Full subnet scan ──────────────────────────────────────────────────────
-
   private async runScan(): Promise<void> {
-    if (!this.listening || !this.onSessionFound) return
+    if (!this.listening || !this.onSessionFound || this.scanInProgress) return
+    this.scanInProgress = true
 
-    const subnet = this.currentSubnet
-    const port = this.currentPort
+    try {
+      const subnet = this.currentSubnet
+      const port = this.currentPort
 
-    if (!subnet) {
-      console.log('[Discovery] No subnet known yet — waiting for network info')
-      return
-    }
+      const localResult = await this.probeHost('127.0.0.1', port)
+      if (localResult && this.onSessionFound) {
+        console.log(`[Discovery] Found host at ${localResult.hostAddress} (localhost)`)
+        this.onSessionFound(localResult)
+        return
+      }
 
-    console.log(`[Discovery] Scanning ${subnet}.1–254 :${port}`)
+      if (!subnet) {
+        console.log('[Discovery] No subnet known yet - skipping LAN scan')
+        return
+      }
 
-    // Build candidate list: common gateway addresses first for speed
-    const priorityHosts = [1, 254, 100, 101, 102, 200]
-    const allHosts: number[] = [
-      ...priorityHosts,
-      ...Array.from({ length: 253 }, (_, i) => i + 1)
-        .filter((n) => !priorityHosts.includes(n)),
-    ]
+      console.log(`[Discovery] Scanning ${subnet}.1-254 :${port}`)
 
-    // Process in batches
-    for (let i = 0; i < allHosts.length; i += SCAN_BATCH_SIZE) {
-      if (this.scanAbortFlag || !this.listening) break
+      const priorityHosts = [1, 254, 100, 101, 102, 200]
+      const allHosts: number[] = [
+        ...priorityHosts,
+        ...Array.from({ length: 253 }, (_, i) => i + 1)
+          .filter((n) => !priorityHosts.includes(n)),
+      ]
 
-      const batch = allHosts.slice(i, i + SCAN_BATCH_SIZE)
-      const results = await Promise.all(
-        batch.map((n) => this.probeHost(`${subnet}.${n}`, port)),
-      )
+      for (let i = 0; i < allHosts.length; i += SCAN_BATCH_SIZE) {
+        if (this.scanAbortFlag || !this.listening) break
 
-      for (const session of results) {
-        if (session && this.onSessionFound) {
-          console.log(`[Discovery] Found host at ${session.hostAddress}`)
-          this.onSessionFound(session)
+        const hostsToProbe = allHosts
+          .slice(i, i + SCAN_BATCH_SIZE)
+          .map((n) => `${subnet}.${n}`)
+
+        const results = await Promise.all(
+          hostsToProbe.map((ip) => this.probeHost(ip, port)),
+        )
+
+        for (const session of results) {
+          if (session && this.onSessionFound) {
+            console.log(`[Discovery] Found host at ${session.hostAddress}`)
+            this.onSessionFound(session)
+            return
+          }
         }
       }
-    }
 
-    console.log('[Discovery] Scan complete')
+      console.log('[Discovery] Scan complete')
+    } finally {
+      this.scanInProgress = false
+    }
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────────────
-
   private deriveSubnet(ip: string): string {
-    // Assume /24 — take first three octets
     const parts = ip.split('.')
     if (parts.length === 4) return `${parts[0]}.${parts[1]}.${parts[2]}`
     return ''
