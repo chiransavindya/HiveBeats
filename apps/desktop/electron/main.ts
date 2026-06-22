@@ -290,8 +290,14 @@ ipcMain.handle('stream:start', (_event, payload: { filePath: string; fileName: s
 ipcMain.handle(
   'stream:start-for-guest',
   (_event, payload: { clientId: string; filePath: string; fileName: string; mimeType: string; trackId: string }) => {
-    // We only need to tell the guest to initialize the stream.
-    // The HTTP server handles the actual streaming.
+    // Make the file servable over HTTP for this (late-joining) guest. Without this
+    // the /stream endpoint 404s until the host presses Play, so a guest that joins
+    // mid-session times out loading the stream and never plays. Safe because there
+    // is only ever one selected track / active stream at a time.
+    activeStreamTrackId = payload.trackId
+    setActiveStreamFilePath(payload.filePath)
+
+    // Tell the guest to initialize the stream. The HTTP server serves the bytes.
     sendToGuest(
       payload.clientId,
       JSON.stringify({

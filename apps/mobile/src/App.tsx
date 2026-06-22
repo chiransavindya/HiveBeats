@@ -32,6 +32,25 @@ import { loadTheme, loadNetworkSettings } from './lib/asyncStorage'
 import { useAppTheme } from './hooks/useAppTheme'
 import type { AppThemeColors } from './theme/theme'
 
+// Guest re-syncs to the host timeline when its DECODE position drifts more than
+// this. Kept loose enough that we don't seek (and re-buffer) on every tick — the
+// small steady-state gap is handled by GUEST_AUDIO_LEAD_MS, not by seeking.
+const DRIFT_CORRECTION_MS = 400
+// Minimum gap between corrective seeks, so we never glitch the audio repeatedly.
+const DRIFT_COOLDOWN_MS = 2500
+// The phone plays a buffered HTTP stream, so its audio comes out of the speaker
+// LATER than the host's local file even when decode positions match. We start the
+// guest this many ms ahead to cancel that output-latency difference. Tune per
+// setup: raise it if the phone still lags the PC, lower it if the phone runs ahead.
+const GUEST_AUDIO_LEAD_MS = 150
+// If the guest was paused longer than this, treat the HTTP stream as stale on
+// resume and reload it — a progressive stream connection usually dies after idle.
+const STALE_STREAM_MS = 20000
+// Safety clamp on scheduled play/seek delays. If a bad clock offset produced a
+// nonsensical future time, never let it strand the guest: play/seek wait at most
+// a little beyond the host's 2s lead. (Pause is applied immediately, never scheduled.)
+const MAX_PLAY_SCHEDULE_MS = 5000
+
 export default function App() {
   return (
     <SafeAreaProvider>
@@ -76,6 +95,23 @@ function MainApp() {
   const guestStreamLoadedRef = useRef(false)
   const guestLoadingTrackRef = useRef<string | null>(null)
   const readyAckInFlightRef = useRef(false)
+  // Command ordering — mirror the desktop guest so stale/duplicate commands are dropped.
+  const guestEpochRef = useRef(0)
+  const guestLastSeqRef = useRef(-1)
+  // Playback anchor for continuous drift correction. When the guest is playing,
+  // the expected position at any moment is anchorPositionMs + (serverNow - anchorServerMs).
+  // serverNow is derived from the synced host clock. null = not playing / no anchor.
+  const playbackAnchorRef = useRef<{ positionMs: number; serverMs: number } | null>(null)
+  const lastDriftSeekRef = useRef(0)
+  // Last stream we were told to load, so we can transparently reload it if the
+  // HTTP connection goes stale (e.g. after a long pause) or the first load failed.
+  const lastStreamRef = useRef<{ streamUrl: string; trackId: string } | null>(null)
+  // True while a stream load is in flight, so we never kick off a second concurrent
+  // load (the host re-sends STREAM_INIT alongside CMD_PLAY on the first play, which
+  // otherwise races two loads and the first play() lands on a torn-down player).
+  const streamLoadingRef = useRef(false)
+  // Wall-clock time the guest was last paused, used to detect a stale stream on resume.
+  const pausedSinceRef = useRef(0)
 
   const clearGuestCommandTimers = () => {
     guestCommandTimersRef.current.forEach(clearTimeout)
@@ -90,26 +126,108 @@ function MainApp() {
     guestCommandTimersRef.current.push(timer)
   }
 
-  const maybeApplyPendingPlay = () => {
-    const msg = pendingPlayRef.current
-    if (!msg || !guestStreamLoadedRef.current || !clockSync.isSynced()) return
+  // Decide whether an incoming transport command should be applied, based on the
+  // host's epoch (a new transport "session" — play/pause/seek/stop) and seq
+  // (monotonic command counter). Drops stale and duplicate commands so the guest
+  // never ends up in a different play state than the host.
+  const shouldApplyCommand = (msg: Record<string, unknown>): boolean => {
+    const epoch = msg.epoch as number | undefined
+    if (epoch !== undefined) {
+      if (epoch < guestEpochRef.current) return false
+      if (epoch > guestEpochRef.current) {
+        guestEpochRef.current = epoch
+        guestLastSeqRef.current = -1
+        clearGuestCommandTimers()
+      }
+    }
+    const seq = msg.seq as number | undefined
+    if (seq !== undefined) {
+      if (seq <= guestLastSeqRef.current) return false
+      guestLastSeqRef.current = seq
+    }
+    return true
+  }
 
-    pendingPlayRef.current = null
-    const positionMs = Number(msg.positionMs ?? 0)
-    const playAt = Number(msg.playAt ?? Date.now())
-    const delay = Math.max(0, clockSync.toLocalTime(playAt) - Date.now())
+  // Load (or reload) the guest's HTTP audio stream. Retries once on failure to
+  // ride out transient host/network hiccups. Resolves true on success. Concurrent
+  // calls are de-duped via streamLoadingRef so two loads never race each other.
+  const loadGuestStream = async (streamUrl: string, trackId: string, attempt = 0): Promise<boolean> => {
+    if (attempt === 0) {
+      if (streamLoadingRef.current) return false // a load is already in flight
+      streamLoadingRef.current = true
+    }
+    lastStreamRef.current = { streamUrl, trackId }
+    guestLoadingTrackRef.current = trackId
+    guestStreamLoadedRef.current = false
+    const { guestMuted, guestVolume } = useSessionStore.getState()
+    try {
+      const { durationMs } = await audioService.load(streamUrl, false, guestMuted ? 0 : guestVolume)
+      if (guestLoadingTrackRef.current !== trackId) { streamLoadingRef.current = false; return false }
+      guestStreamLoadedRef.current = true
+      streamLoadingRef.current = false
+      useSessionStore.setState({ guestStreamReady: true, guestError: null })
+      if (durationMs > 0) useSessionStore.setState({ guestDurationMs: durationMs })
+      pushLog('Stream loaded')
+      return true
+    } catch (err) {
+      if (guestLoadingTrackRef.current !== trackId) { streamLoadingRef.current = false; return false }
+      if (attempt < 1) {
+        pushLog('Stream load failed — retrying…')
+        return loadGuestStream(streamUrl, trackId, attempt + 1)
+      }
+      streamLoadingRef.current = false
+      const message = err instanceof Error ? err.message : String(err)
+      pushLog(`Stream load failed: ${message}`)
+      useSessionStore.setState({ guestError: `Stream load failed: ${message}`, guestStreamReady: false })
+      return false
+    }
+  }
 
-    useSessionStore.setState({ guestPositionMs: positionMs })
+  // expo-audio sometimes swallows the first play() issued right after a seek/buffer
+  // (the "first press is silent, second works" symptom). After starting playback we
+  // verify it actually began and re-issue play() a few times if not. Bails out the
+  // moment the host is no longer playing, so it never fights a pause.
+  const ensureGuestPlaying = (attempt: number) => {
+    if (attempt >= 4) return
+    scheduleGuestCommand(() => {
+      if (!useSessionStore.getState().hostPlaying) return
+      if (!audioService.isPlaying()) {
+        void audioService.play()
+        ensureGuestPlaying(attempt + 1)
+      }
+    }, 350)
+  }
+
+  // Single path for starting guest playback in sync with the host. Seeks to the
+  // host position plus the output-latency lead, waits until the shared `playAt`
+  // instant (converted to local time, clamped), then plays and records the anchor
+  // the drift corrector uses. Used by CMD_PLAY, resume-after-seek and queued plays.
+  const scheduleGuestPlayback = (basePositionMs: number, playAt: number) => {
+    const target = Math.max(0, basePositionMs + GUEST_AUDIO_LEAD_MS)
+    const delay = Math.min(MAX_PLAY_SCHEDULE_MS, Math.max(0, clockSync.toLocalTime(playAt) - Date.now()))
+    useSessionStore.setState({ guestPositionMs: basePositionMs })
+    clearGuestCommandTimers()
     const seekStartedAt = Date.now()
-    void audioService.seek(positionMs)
+    void audioService.seek(target)
       .catch((err) => pushLog(`Play seek failed: ${err.message}`))
       .finally(() => {
         const remainingDelay = Math.max(0, delay - (Date.now() - seekStartedAt))
         scheduleGuestCommand(() => {
           void audioService.play()
+          // Anchor: at server time `playAt`, the decode position is `target`.
+          playbackAnchorRef.current = { positionMs: target, serverMs: playAt }
           useSessionStore.setState({ hostPlaying: true })
+          ensureGuestPlaying(0)
         }, remainingDelay)
       })
+  }
+
+  const maybeApplyPendingPlay = () => {
+    const msg = pendingPlayRef.current
+    if (!msg || !guestStreamLoadedRef.current || !clockSync.isSynced()) return
+
+    pendingPlayRef.current = null
+    scheduleGuestPlayback(Number(msg.positionMs ?? 0), Number(msg.playAt ?? Date.now()))
   }
 
   const maybeSendReadyAck = () => {
@@ -255,53 +373,74 @@ function MainApp() {
           break
 
         case 'CMD_PLAY': {
+          if (!shouldApplyCommand(msg)) { pushLog('CMD_PLAY ignored (stale)'); break }
           const positionMs = Number(msg.positionMs ?? 0)
           const playAt = Number(msg.playAt ?? Date.now())
-          const localPlayAt = clockSync.toLocalTime(playAt)
-          const delay = Math.max(0, localPlayAt - Date.now())
 
-          if (!guestStreamLoadedRef.current || !clockSync.isSynced()) {
+          // Detect a stale stream: the first load failed, or we are resuming after a
+          // long pause where the progressive HTTP connection has likely dropped (the
+          // "paused >40s and only the PC plays" symptom). Reload before resuming.
+          const pausedMs = pausedSinceRef.current ? Date.now() - pausedSinceRef.current : 0
+          const streamStale = !guestStreamLoadedRef.current || pausedMs > STALE_STREAM_MS
+          pausedSinceRef.current = 0
+
+          if (streamStale || !clockSync.isSynced()) {
             pendingPlayRef.current = msg
-            pushLog('CMD_PLAY queued until stream and sync are ready')
-            return
+            // Only kick a reload if one isn't already in flight (e.g. from a
+            // just-received STREAM_INIT). The in-flight load applies the pending play.
+            if (streamStale && lastStreamRef.current && !streamLoadingRef.current) {
+              pushLog('Reloading stream before resume')
+              const { streamUrl, trackId } = lastStreamRef.current
+              void loadGuestStream(streamUrl, trackId).then((ok) => { if (ok) maybeApplyPendingPlay() })
+            } else {
+              pushLog('CMD_PLAY queued until stream is ready')
+            }
+            break
           }
-          
-          // Only seek if we are out of sync by more than 1.5 seconds, or if starting from the beginning
-          const currentPos = useSessionStore.getState().guestPositionMs
-          useSessionStore.setState({ guestPositionMs: positionMs })
 
-          clearGuestCommandTimers()
-          const needsSeek = Math.abs(currentPos - positionMs) > 1500 || positionMs < 100
-          const seekStartedAt = Date.now()
-          const readyToSchedule = needsSeek
-            ? audioService.seek(positionMs).catch((err) => pushLog(`Play seek failed: ${err.message}`))
-            : Promise.resolve()
-          void readyToSchedule.finally(() => {
-            const remainingDelay = Math.max(0, delay - (Date.now() - seekStartedAt))
-            scheduleGuestCommand(() => {
-              void audioService.play()
-              useSessionStore.setState({ hostPlaying: true })
-            }, remainingDelay)
-          })
+          scheduleGuestPlayback(positionMs, playAt)
           break
         }
 
         case 'CMD_PAUSE': {
-          const pauseAt = Number(msg.pauseAt ?? Date.now())
-          const localPauseAt = clockSync.toLocalTime(pauseAt)
-          const delay = Math.max(0, localPauseAt - Date.now())
+          if (!shouldApplyCommand(msg)) { pushLog('CMD_PAUSE ignored (stale)'); break }
+          const positionMs = Number(msg.positionMs ?? NaN)
+          // A pause is a "stop now" — apply it immediately and unconditionally rather
+          // than on a timer. Deferring it (or seeking right after) risks expo-audio
+          // staying in the playing state, which is the "host paused but mobile keeps
+          // playing" bug. Being a few hundred ms early on a pause is inaudible.
           clearGuestCommandTimers()
-          scheduleGuestCommand(() => {
-            void audioService.pause()
-            useSessionStore.setState({ hostPlaying: false })
-          }, delay)
+          // Cancel any queued play — otherwise it would resurrect playback on the
+          // next SYNC_PONG / stream-load and leave the guest playing while the host is paused.
+          pendingPlayRef.current = null
+          playbackAnchorRef.current = null
+          pausedSinceRef.current = Date.now()
+          void audioService.pause()
+          // Reflect the host's pause position in the UI; resume re-seeks anyway, so we
+          // don't seek the player here (a seek can nudge expo-audio back into playing).
+          if (Number.isFinite(positionMs)) useSessionStore.setState({ guestPositionMs: positionMs })
+          useSessionStore.setState({ hostPlaying: false })
           break
         }
 
         case 'CMD_SEEK': {
+          if (!shouldApplyCommand(msg)) { pushLog('CMD_SEEK ignored (stale)'); break }
           const positionMs = Number(msg.positionMs ?? 0)
-          useSessionStore.setState({ guestPositionMs: positionMs })
-          void audioService.seek(positionMs)
+          const playAt = Number(msg.playAt ?? Date.now())
+          const wasPlaying = useSessionStore.getState().hostPlaying
+
+          clearGuestCommandTimers()
+          playbackAnchorRef.current = null
+          pausedSinceRef.current = 0
+
+          if (wasPlaying) {
+            // Mirror the desktop guest: resume playback after a seek so scrubbing
+            // doesn't leave the guest silent while the host plays on.
+            scheduleGuestPlayback(positionMs, playAt)
+          } else {
+            useSessionStore.setState({ guestPositionMs: positionMs })
+            void audioService.seek(positionMs).catch((err) => pushLog(`Seek failed: ${err.message}`))
+          }
           break
         }
 
@@ -311,9 +450,10 @@ function MainApp() {
           const t1 = Number(msg.t1 ?? 0)
           const t2 = Number(msg.t2 ?? 0)
           const offset = ((t1 - t0) + (t2 - t3)) / 2
-          clockSync.applyOffset(offset)
+          const rtt = (t3 - t0) - (t2 - t1)
+          clockSync.applySample(offset, rtt)
           useSessionStore.setState({
-            clockOffsetMs: offset,
+            clockOffsetMs: clockSync.getOffset(),
             guestSyncReady: true,
           })
           maybeSendReadyAck()
@@ -343,12 +483,24 @@ function MainApp() {
           const streamUrl = `http://${hostIp}:${hostPort}/stream${ext}?trackId=${msg.trackId}`
           const trackId = String(msg.trackId ?? '')
 
+          // The host re-sends STREAM_INIT for the current track on the first play
+          // (handlePlay calls startStream right before broadcasting CMD_PLAY). If it's
+          // the same stream we already have loaded/loading, don't tear it down — that
+          // teardown is exactly what made the first play silent. Just keep going.
+          const sameStream = lastStreamRef.current?.streamUrl === streamUrl &&
+            (guestStreamLoadedRef.current || streamLoadingRef.current)
+          if (sameStream) {
+            pushLog('STREAM_INIT (same track) — keeping loaded stream')
+            break
+          }
+
           clearGuestCommandTimers()
           pendingPlayRef.current = null
           pendingReadyRef.current = null
+          playbackAnchorRef.current = null
           readyAckInFlightRef.current = false
+          pausedSinceRef.current = 0
           guestStreamLoadedRef.current = false
-          guestLoadingTrackRef.current = trackId
           useSessionStore.setState({
             guestTrackName: String(msg.fileName ?? ''),
             guestStreamReady: false,
@@ -357,25 +509,12 @@ function MainApp() {
             guestDurationMs: 0,
           })
           pushLog(`Track: ${String(msg.fileName ?? '')}`)
-          
-          audioService.load(streamUrl, false, useSessionStore.getState().guestMuted ? 0 : useSessionStore.getState().guestVolume)
-            .then(({ durationMs }) => {
-              if (guestLoadingTrackRef.current !== trackId) return
-              guestStreamLoadedRef.current = true
-              useSessionStore.setState({ guestStreamReady: true })
-              if (durationMs > 0) useSessionStore.setState({ guestDurationMs: durationMs })
-              pushLog('Stream loaded')
-              maybeSendReadyAck()
-              maybeApplyPendingPlay()
-            })
-            .catch(err => {
-              if (guestLoadingTrackRef.current !== trackId) return
-              pushLog(`Stream load failed: ${err.message}`)
-              useSessionStore.setState({
-                guestError: `Stream load failed: ${err.message}`,
-                guestStreamReady: false,
-              })
-            })
+
+          void loadGuestStream(streamUrl, trackId).then((ok) => {
+            if (!ok) return
+            maybeSendReadyAck()
+            maybeApplyPendingPlay()
+          })
           break
         }
 
@@ -389,8 +528,14 @@ function MainApp() {
       clearGuestCommandTimers()
       pendingPlayRef.current = null
       pendingReadyRef.current = null
+      playbackAnchorRef.current = null
+      lastStreamRef.current = null
+      pausedSinceRef.current = 0
+      streamLoadingRef.current = false
       readyAckInFlightRef.current = false
       guestStreamLoadedRef.current = false
+      guestEpochRef.current = 0
+      guestLastSeqRef.current = -1
       void leaveSession()
     }
 
@@ -415,6 +560,32 @@ function MainApp() {
       const isGuest = useSessionStore.getState().guestConnected
       if (status.isLoaded) {
         if (isGuest) {
+          // ── Continuous drift correction ──────────────────────────────────
+          // The guest streams over HTTP (buffering + decode latency) while the
+          // host plays a local file, so the two decoders drift apart. We compare
+          // the guest's actual position against where the host's timeline says it
+          // should be, and nudge with a seek when the gap is audible. This is what
+          // keeps "one voice, one speaker" alignment over the whole track.
+          const anchor = playbackAnchorRef.current
+          const hostPlaying = useSessionStore.getState().hostPlaying
+          if (
+            anchor && hostPlaying && clockSync.isSynced() &&
+            !status.isBuffering && status.durationMs > 0
+          ) {
+            const serverNow = clockSync.toServerTime(Date.now())
+            const expected = anchor.positionMs + (serverNow - anchor.serverMs)
+            const drift = status.positionMs - expected
+            const now = Date.now()
+            if (
+              Math.abs(drift) > DRIFT_CORRECTION_MS &&
+              expected > 0 && expected < status.durationMs - 500 &&
+              now - lastDriftSeekRef.current > DRIFT_COOLDOWN_MS
+            ) {
+              lastDriftSeekRef.current = now
+              void audioService.seek(expected)
+              pushLog(`Drift ${Math.round(drift)}ms — re-synced to host`)
+            }
+          }
           useSessionStore.setState({
             guestPositionMs: status.positionMs,
             guestDurationMs: status.durationMs,

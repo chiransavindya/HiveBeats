@@ -11,9 +11,16 @@
 
 export type PingFn = () => Promise<{ t1: number; t2: number; t3: number }>
 
+type Sample = { offset: number; rtt: number }
+
 class ClockSync {
   private offset: number = 0  // local_time + offset ≈ server_time
   private synced: boolean = false
+  // Rolling window of recent NTP samples. We trust the sample with the lowest
+  // round-trip time (least queuing jitter) rather than the most recent one,
+  // which keeps the offset stable on noisy Wi-Fi and prevents audible drift.
+  private samples: Sample[] = []
+  private static readonly WINDOW = 8
 
   // ── Synchronize via NTP round-trip ────────────────────────────────────────
 
@@ -43,11 +50,28 @@ class ClockSync {
     this.synced = true
   }
 
+  // ── Feed a single round-trip sample ───────────────────────────────────────
+  // Keeps a rolling window and adopts the offset of the lowest-RTT sample.
+  // This filters out jittery samples (the usual cause of a fluctuating A/V gap).
+
+  applySample(offsetMs: number, rttMs: number): void {
+    this.samples.push({ offset: offsetMs, rtt: Math.max(0, rttMs) })
+    if (this.samples.length > ClockSync.WINDOW) this.samples.shift()
+
+    let best = this.samples[0]
+    for (const s of this.samples) {
+      if (s.rtt < best.rtt) best = s
+    }
+    this.offset = best.offset
+    this.synced = true
+  }
+
   // ── Reset ─────────────────────────────────────────────────────────────────
 
   reset(): void {
     this.offset = 0
     this.synced = false
+    this.samples = []
   }
 
   // ── Conversions ───────────────────────────────────────────────────────────

@@ -189,6 +189,10 @@ class AudioService {
     return this.player !== null
   }
 
+  isPlaying(): boolean {
+    return this.player?.playing ?? false
+  }
+
   getCurrentPositionMs(): number {
     return Math.round((this.player?.currentTime ?? 0) * 1000)
   }
